@@ -1,0 +1,23 @@
+# Auto 模式录制节点配置
+# 路径: config/auto_recorder.yaml
+
+# 数据源话题（可按需增删）
+# 头部相机用 compressed（实测 resize 跨机/多订阅者会降频，compressed 不会）
+state_topic: "/feedback/robot_server_state"
+head_compressed_topic: "/camera/kfc_compressed"
+hand_left_topic: "/camera_l/color/image_rect_raw"
+hand_right_topic: "/camera_r/color/image_rect_raw"
+ee_left_topic: "/control/ee/left"
+ee_right_topic: "/control/ee/right"
+
+# 存储路径
+output_dir: "data"
+
+# 保存格式：video（H.264 MP4，GStreamer NVENC 硬编，默认）或 jpeg（逐帧 JPEG）
+save_format: "video"
+
+# 帧缓冲大小（满了丢最旧帧）
+max_buffer_frames: 600
+
+# 单段最大时长（秒），0=不限
+max_segment_duration_sec: 0
