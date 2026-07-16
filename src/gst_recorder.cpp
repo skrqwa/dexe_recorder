@@ -1,5 +1,5 @@
 // ----------------------------------------------------------------------------
-// Copyright (c) 2021-2025 DexForce Technology Co., Ltd.
+// Copyright (c) 2021-2026 DexForce Technology Co., Ltd.
 //
 // All rights reserved.
 // ----------------------------------------------------------------------------
@@ -7,9 +7,11 @@
  * @file gst_recorder.cpp
  * @brief GStreamer 录制器实现：3 条 pipeline 管理与数据推送
  *
- * Head pipeline: appsrc -> jpegparse -> nvjpegdec(硬解) -> nvvidconv(NVMM->sysmem)
- *                -> tee -> [videocrop 左/右] -> nvvidconv -> nvv4l2h264enc -> qtmux -> filesink
- * Hand pipeline:  appsrc -> nvvidconv -> nvv4l2h264enc -> qtmux -> filesink
+ * Head pipeline: appsrc -> jpegparse -> nvjpegdec(硬解) ->
+ * nvvidconv(NVMM->sysmem)
+ *                -> tee -> [videocrop 左/右] -> nvvidconv -> nvv4l2h264enc ->
+ * qtmux -> filesink Hand pipeline:  appsrc -> nvvidconv -> nvv4l2h264enc ->
+ * qtmux -> filesink
  */
 #include "dexe_recorder/gst_recorder.h"
 
@@ -85,8 +87,9 @@ bool GstRecorder::Start(const std::string& session_dir, Format format)
  *
  * kfc_compressed 是左右目并排 JPEG（如 3840x1080），需要用 videocrop 拆分：
  * appsrc -> jpegparse -> nvjpegdec(硬解) -> nvvidconv(NVMM->sysmem) -> tee
- *   ├-> videocrop(左 0-1920) -> nvvidconv -> nvv4l2h264enc -> qtmux -> filesink(head/left/video.mp4)
- *   └-> videocrop(右 1920-3840) -> nvvidconv -> nvv4l2h264enc -> qtmux -> filesink(head/right/video.mp4)
+ *   ├-> videocrop(左 0-1920) -> nvvidconv -> nvv4l2h264enc -> qtmux ->
+ * filesink(head/left/video.mp4) └-> videocrop(右 1920-3840) -> nvvidconv ->
+ * nvv4l2h264enc -> qtmux -> filesink(head/right/video.mp4)
  *
  * @param session_dir 录制目录
  * @param format 录制格式（VIDEO 或 JPEG）
@@ -126,7 +129,8 @@ bool GstRecorder::CreateHeadPipeline(const std::string& session_dir, Format form
     std::string sink_left, sink_right;
     if (format == Format::VIDEO)
     {
-        // video 模式：videocrop 裁切 -> nvvidconv 转 NVMM -> nvv4l2h264enc 硬编 -> mp4mux
+        // video 模式：videocrop 裁切 -> nvvidconv 转 NVMM -> nvv4l2h264enc 硬编 ->
+        // mp4mux
         encode_branch =
             "! nvvidconv compute-hw=1 "
             "! video/x-raw(memory:NVMM),format=I420 "
@@ -229,7 +233,8 @@ bool GstRecorder::CreateHeadPipeline(const std::string& session_dir, Format form
  * @brief 创建手部相机 pipeline
  *
  * 手部相机是单目 raw Image（如 640x360 BGR），无需拆分：
- * appsrc -> nvvidconv -> nvv4l2h264enc -> qtmux -> filesink(hand/{camera_name}/video.mp4)
+ * appsrc -> nvvidconv -> nvv4l2h264enc -> qtmux ->
+ * filesink(hand/{camera_name}/video.mp4)
  *
  * @param session_dir 录制目录
  * @param camera_name 相机名（"hand_left" 或 "hand_right"）

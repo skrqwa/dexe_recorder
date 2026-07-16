@@ -1,5 +1,5 @@
 // ----------------------------------------------------------------------------
-// Copyright (c) 2021-2025 DexForce Technology Co., Ltd.
+// Copyright (c) 2021-2026 DexForce Technology Co., Ltd.
 //
 // All rights reserved.
 // ----------------------------------------------------------------------------
@@ -473,9 +473,10 @@ std::string RecorderNode::MapEeJointName(const std::string& side,
     // BrainCo_Revo1_R / BrainCo_Revo1_E
     if (ee_name == "BrainCo_Revo1_R" || ee_name == "BrainCo_Revo1_E")
     {
-        // SIX_DOF_EE_JOINT_NAMES 顺序: T_MCP, T_CMC_YAW, IF_MCP_PITCH, MF_MCP_PITCH, RF_MCP_PITCH, LF_MCP_PITCH
-        // 映射到 DEFAULT_HAND_CONTROL_JOINT_NAMES: HAND_THUMB1, HAND_THUMB2, HAND_INDEX, HAND_MIDDLE, HAND_RING,
-        // HAND_PINKY
+        // SIX_DOF_EE_JOINT_NAMES 顺序: T_MCP, T_CMC_YAW, IF_MCP_PITCH,
+        // MF_MCP_PITCH, RF_MCP_PITCH, LF_MCP_PITCH 映射到
+        // DEFAULT_HAND_CONTROL_JOINT_NAMES: HAND_THUMB1, HAND_THUMB2, HAND_INDEX,
+        // HAND_MIDDLE, HAND_RING, HAND_PINKY
         static const std::map<std::string, std::string> brainco_map = {
             {"T_MCP", "HAND_THUMB1"},
             {"T_CMC_YAW", "HAND_THUMB2"},
@@ -497,7 +498,8 @@ std::string RecorderNode::MapEeJointName(const std::string& side,
         return prefix + "GRIPPER";
     }
 
-    // 其他灵巧手（Linker_L6, Linker_L20, PaXini_Dex_H13, DexHand_021S）：直接加前缀
+    // 其他灵巧手（Linker_L6, Linker_L20, PaXini_Dex_H13,
+    // DexHand_021S）：直接加前缀
     return prefix + joint_name;
 }
 
@@ -794,8 +796,9 @@ void RecorderNode::FinalizePoseRecord()
     root["end_time"] = session_end_time_;
     root["duration"] = session_end_time_ - session_start_time_;
 
-    // 手动构建 JSON 保持帧的顺序（pose_frames_ 存的是 ordered_json dump(2) 的字符串）
-    // 每帧缩进 4 空格（帧内已有 2 空格缩进，额外加 4 空格 -> 6 空格，与遥操格式一致）
+    // 手动构建 JSON 保持帧的顺序（pose_frames_ 存的是 ordered_json dump(2)
+    // 的字符串） 每帧缩进 4 空格（帧内已有 2 空格缩进，额外加 4 空格 -> 6
+    // 空格，与遥操格式一致）
     std::string frames_str = "[\n";
     {
         std::lock_guard<std::mutex> lk(image_mtx_);

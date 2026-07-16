@@ -1,5 +1,5 @@
 // ----------------------------------------------------------------------------
-// Copyright (c) 2021-2025 DexForce Technology Co., Ltd.
+// Copyright (c) 2021-2026 DexForce Technology Co., Ltd.
 //
 // All rights reserved.
 // ----------------------------------------------------------------------------
@@ -15,7 +15,8 @@ namespace dexe_recorder
 {
 
 /**
- * @brief GStreamer 录制器：处理 kfc_compressed（左右目并排 JPEG）拆分 + 视频/图片保存
+ * @brief GStreamer 录制器：处理 kfc_compressed（左右目并排 JPEG）拆分 +
+ * 视频/图片保存
  *
  * 管理 3 条独立 GStreamer pipeline：
  * - Head pipeline：头部相机 JPEG 拆分为左右目
