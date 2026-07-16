@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "end_effector_interfaces/msg/ee_feedback.hpp"
 #include "end_effector_interfaces/msg/ee_joint_control.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
@@ -122,10 +123,12 @@ class RecorderNode : public rclcpp::Node {
   void OnState(const std_msgs::msg::String::ConstSharedPtr msg);
   void OnImage(const std::string& camera_name, const sensor_msgs::msg::Image::ConstSharedPtr msg);
   void OnCompressedImage(const sensor_msgs::msg::CompressedImage::ConstSharedPtr msg);
-  void OnEndEffector(const std::string& side, const end_effector_interfaces::msg::EEJointControl::ConstSharedPtr msg);
+  void OnEndEffector(const std::string& side, const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg);
+  void OnEeCommand(const std::string& side, const end_effector_interfaces::msg::EEJointControl::ConstSharedPtr msg);
 
   // 写盘线程
   void WriterLoop();
+  void FeedbackWriterLoop();
 
   // 启动/停止录制会话
   bool StartRecording();
@@ -138,14 +141,21 @@ class RecorderNode : public rclcpp::Node {
   void FinalizePoseRecord();
   std::string ImagePath(const std::string& camera_type, uint64_t frame_id) const;
 
+  // EE 关节名映射（与遥操 ee_hand_mapping.py 保持一致）
+  std::string MapEeJointName(const std::string& side, const std::string& ee_name,
+                              const std::string& joint_name) const;
+  void FinalizeFeedbackRecord();
+
   RecorderConfig config_;
 
   // ROS 接口
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr state_sub_;
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr head_compressed_sub_;
   std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subs_;
-  rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_left_sub_;
-  rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_right_sub_;
+  rclcpp::Subscription<end_effector_interfaces::msg::EEFeedback>::SharedPtr ee_left_sub_;
+  rclcpp::Subscription<end_effector_interfaces::msg::EEFeedback>::SharedPtr ee_right_sub_;
+  rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_cmd_left_sub_;
+  rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_cmd_right_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr status_srv_;
@@ -165,8 +175,20 @@ class RecorderNode : public rclcpp::Node {
   std::mutex latest_state_mtx_;
   Frame latest_state_frame_;  // 仅 joint 字段有效
 
-  // 最新 EE 数据缓存（供 WriteFrame 合并到 pose JSON）
+  // 最新 EE 反馈数据缓存（供 feedback_record 用）
   std::map<std::string, double> latest_ee_values_;
+  std::string ee_left_name_;   // 左手末端型号（从 EEFeedback.ee_name 获取）
+  std::string ee_right_name_;  // 右手末端型号
+
+  // 最新 EE 命令缓存（供 pose_record 用）
+  std::map<std::string, double> latest_ee_cmd_values_;
+
+  // 反馈录制（30Hz 独立写线程）
+  std::ofstream feedback_file_;
+  std::thread feedback_writer_thread_;
+  std::atomic<bool> feedback_recording_{false};
+  std::atomic<uint64_t> feedback_frame_counter_{0};
+  std::vector<std::string> feedback_frames_;
 
   // 写盘
   std::unique_ptr<FrameBuffer> buffer_;

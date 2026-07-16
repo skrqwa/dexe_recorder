@@ -7,8 +7,8 @@ state_topic: "/feedback/robot_server_state"
 head_compressed_topic: "/camera/kfc_compressed"
 hand_left_topic: "/camera_l/color/image_rect_raw"
 hand_right_topic: "/camera_r/color/image_rect_raw"
-ee_left_topic: "/control/ee/left"
-ee_right_topic: "/control/ee/right"
+ee_left_topic: "/feedback/ee/left"
+ee_right_topic: "/feedback/ee/right"
 
 # 存储路径
 output_dir: "data"
