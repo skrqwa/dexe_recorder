@@ -290,14 +290,14 @@ private:
     // ---- ROS2 接口 ----
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr state_sub_;                        ///< 关节状态订阅
     rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr head_compressed_sub_;  ///< 头部相机订阅
-    std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subs_;  ///< 手部相机订阅列表
+    std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subs_;        ///< 手部相机订阅列表
     rclcpp::Subscription<end_effector_interfaces::msg::EEFeedback>::SharedPtr ee_left_sub_;   ///< EE 反馈左订阅
     rclcpp::Subscription<end_effector_interfaces::msg::EEFeedback>::SharedPtr ee_right_sub_;  ///< EE 反馈右订阅
-    rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_cmd_left_sub_;  ///< EE 命令左订阅
+    rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_cmd_left_sub_;   ///< EE 命令左订阅
     rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_cmd_right_sub_;  ///< EE 命令右订阅
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;   ///< 开始录制服务
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;    ///< 停止录制服务
-    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr status_srv_;  ///< 查询状态服务
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;                                    ///< 开始录制服务
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;                                     ///< 停止录制服务
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr status_srv_;                                   ///< 查询状态服务
 
     // ---- 录制状态 ----
     std::atomic<bool> recording_{false};            ///< 是否正在录制

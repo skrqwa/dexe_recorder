@@ -5,7 +5,7 @@
 检查 clang-format 格式和 DexForce 版权头。
 
 依赖：
-  - clang-format >= 14.0.0
+  - clang-format >= 18.1.4（版本过低可执行 pip3 install clang-format --upgrade 安装最新版）
   - chardet（pip install chardet）
 
 用法：
@@ -168,34 +168,34 @@ class CppFormatter:
             raise Exception("Error parsing clang-format version")
         version = result.stdout.split()[2]
         print(f"clang-format version: {version}")
-        required_version = "14.0.0"
+        required_version = "18.1.4"
         if version < required_version:
             raise Exception(
-                f"Please install clang-format version {required_version} or higher"
+                f"Please install clang-format version {required_version} or higher "
+                f"(run: pip3 install clang-format --upgrade)"
             )
 
     @staticmethod
     def _check_style(file_path):
-        """Returns (is_valid_style, is_valid_header)"""
+        """
+        Returns (true, true) if (style, header) is valid.
+        """
         header_status = check_header(
             file_path, CppFormatter.standard_header, CppFormatter.header_pattern
         )
         is_valid_header = header_status == "correct"
 
-        # 用 --dry-run 检测是否需要格式化（兼容不支持某些 key 的旧版 clang-format）
         cmd = [
             "clang-format",
             "--style=file:./.clang-format",
-            "--dry-run",
-            "--Werror",
+            "--output-replacements-xml",
             file_path,
         ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            # 退出码 0 表示无需修改；非 0 表示有 diff 或有警告
-            is_valid_style = result.returncode == 0
-        except Exception:
+        result = subprocess.check_output(cmd).decode("utf-8")
+        if "<replacement " in result:
             is_valid_style = False
+        else:
+            is_valid_style = True
 
         return (is_valid_style, is_valid_header)
 
@@ -204,19 +204,14 @@ class CppFormatter:
         update_header(
             file_path, CppFormatter.standard_header, CppFormatter.header_pattern
         )
-        # apply style（容错：旧版 clang-format 遇到不支持的 key 会报错，忽略 stderr 继续格式化）
-        cmd = ["clang-format", "--style=file:./.clang-format", "-i", file_path]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            # 尝试 fallback：用 Google 默认风格格式化
-            fallback_cmd = ["clang-format", "--style=Google", "-i", file_path]
-            subprocess.run(fallback_cmd, capture_output=True, text=True)
-        # 确保文件末尾有换行符（等价于 InsertNewlineAtEOF: true）
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        if content and not content.endswith("\n"):
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content + "\n")
+        # apply style
+        cmd = [
+            "clang-format",
+            "--style=file:./.clang-format",
+            "-i",
+            file_path,
+        ]
+        subprocess.check_output(cmd)
 
     def run(self, apply, verbose):
         """执行代码风格检查"""

@@ -11,3 +11,4 @@ SortIncludes: CaseSensitive
 SeparateDefinitionBlocks: Always
 BreakBeforeBraces: Allman
 AllowShortFunctionsOnASingleLine: Empty
+InsertNewlineAtEOF: true
