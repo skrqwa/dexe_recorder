@@ -4,3 +4,5 @@ log/
 release/
 data/
 *.tar.gz
+__pycache__/
+.pytest_cache/

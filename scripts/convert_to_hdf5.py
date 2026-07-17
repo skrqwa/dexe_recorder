@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# ----------------------------------------------------------------------------
+# Copyright (c) 2021-2025 DexForce Technology Co., Ltd.
+#
+# All rights reserved.
+# ----------------------------------------------------------------------------
 # -*- coding: utf-8 -*-
 """
 dexe_recorder 录制数据转 HDF5
@@ -166,8 +171,85 @@ def detect_format(data_dir: Path, camera_groups: Dict) -> str:
     return "video"  # 默认
 
 
+def choose_reference_camera(camera_groups: Dict[str, List[Dict]]) -> str:
+    """选择参考相机：优先 head_left，其次任意 _left，最后任意。
+
+    与遥操 _choose_reference_camera 策略一致。
+    """
+    preferred = "head_left"
+    if preferred in camera_groups:
+        return preferred
+    for cam in sorted(camera_groups.keys()):
+        if cam.endswith("_left"):
+            return cam
+    return next(iter(camera_groups.keys()))
+
+
+def validate_cameras(
+    camera_groups: Dict[str, List[Dict]],
+    ref_camera: str,
+    fmt: str,
+) -> None:
+    """校验相机数据一致性。
+
+    JPEG 模式：校验各相机帧数相等 + 图片文件名逐一对应。
+    VIDEO 模式：只校验各相机帧数相等（image_path 是虚拟 jpg 名）。
+    与遥操 parse_metadata_aligned 校验逻辑一致。
+    """
+    ref_entries = camera_groups[ref_camera]
+    ref_count = len(ref_entries)
+
+    for cam, entries in camera_groups.items():
+        if len(entries) != ref_count:
+            raise ValueError(
+                f"相机帧数不一致: {cam}={len(entries)}, {ref_camera}={ref_count}")
+
+    if fmt == "jpeg":
+        ref_names = [Path(e.get("image_path", "")).name for e in ref_entries]
+        for cam, entries in camera_groups.items():
+            if cam == ref_camera:
+                continue
+            mismatches = []
+            for i, (ref_name, entry) in enumerate(zip(ref_names, entries)):
+                pic_name = Path(entry.get("image_path", "")).name
+                if pic_name != ref_name:
+                    mismatches.append(
+                        f"frame {i}: {ref_camera}={ref_name}, {cam}={pic_name}")
+                    if len(mismatches) >= 5:
+                        break
+            if mismatches:
+                raise ValueError(
+                    f"图片名不一致: {cam} vs {ref_camera}; {mismatches}")
+
+
+def interp_qpos(
+    qpos_ts: np.ndarray,
+    qpos: np.ndarray,
+    target_ts: np.ndarray,
+) -> np.ndarray:
+    """将关节数据插值到目标时间戳。
+
+    与遥操 interp_qpos 逻辑一致：逐关节 np.interp。
+    """
+    if qpos.size == 0 or len(target_ts) == 0:
+        return np.zeros((len(target_ts), qpos.shape[1] if qpos.ndim > 1 else 0),
+                        dtype=np.float32)
+    D = qpos.shape[1]
+    out = np.zeros((len(target_ts), D), dtype=np.float32)
+    for d in range(D):
+        out[:, d] = np.interp(target_ts, qpos_ts, qpos[:, d])
+    return out
+
+
 def process_session(data_dir: Path, output_dir: Path, fmt: str) -> bool:
-    """处理单个 session，生成 HDF5"""
+    """处理单个 session，生成 HDF5。
+
+    核心对齐逻辑：
+    - 以参考相机（head_left 优先）的时间戳为基准
+    - 关节数据用 np.interp 插值到参考相机时间戳
+    - JPEG 模式严格校验，VIDEO 模式只校验帧数相等
+    - 相机 timestamps 用参考相机时间戳，所有相机共用
+    """
     session_id = data_dir.name
 
     # 加载数据
@@ -183,32 +265,53 @@ def process_session(data_dir: Path, output_dir: Path, fmt: str) -> bool:
 
     # 按相机分组
     camera_groups = group_metadata_by_camera(metadata)
+    if not camera_groups:
+        print(f"  [SKIP] {session_id}: 无相机数据")
+        return False
 
     # 自动检测格式（如果未指定）
     if fmt == "auto":
         fmt = detect_format(data_dir, camera_groups)
         print(f"  检测到格式: {fmt}")
 
-    # 帧数：以关节数据为准
+    # 选择参考相机
+    ref_camera = choose_reference_camera(camera_groups)
+    print(f"  参考相机: {ref_camera}")
+
+    # 校验相机数据
+    validate_cameras(camera_groups, ref_camera, fmt)
+
+    # 参考相机时间戳（作为 HDF5 的基准时间轴）
+    ref_entries = camera_groups[ref_camera]
+    ref_timestamps = np.array(
+        [e.get("timestamp", 0.0) for e in ref_entries], dtype=np.float64)
+    num_frames = len(ref_entries)
+    print(f"  帧数: {num_frames} (参考相机 {ref_camera})")
+
+    # 加载关节数据
     pose_frames = pose_record.get("frames", [])
-    num_frames = len(pose_frames)
-    if num_frames == 0:
+    if not pose_frames:
         print(f"  [SKIP] {session_id}: 无关节数据")
         return False
 
-    # 关节键名
-    joint_keys = []
-    if pose_frames:
-        joint_keys = list(pose_frames[0].get("data", {}).keys())
+    joint_keys = list(pose_frames[0].get("data", {}).keys())
+    print(f"  关节数: {len(joint_keys)}")
+
+    # 关节时间戳和数值
+    qpos_ts = np.array(
+        [f.get("timestamp", 0.0) for f in pose_frames], dtype=np.float64)
+    qpos = np.zeros((len(pose_frames), len(joint_keys)), dtype=np.float32)
+    for i, frame in enumerate(pose_frames):
+        data = frame.get("data", {})
+        for j, key in enumerate(joint_keys):
+            qpos[i, j] = data.get(key, 0.0)
+
+    # 插值关节数据到参考相机时间戳
+    print(f"  插值关节数据: {len(pose_frames)} -> {num_frames} 帧")
+    qpos_interp = interp_qpos(qpos_ts, qpos, ref_timestamps)
 
     # 相机列表
     selected_cameras = sorted(camera_groups.keys())
-    if not selected_cameras:
-        print(f"  [SKIP] {session_id}: 无相机数据")
-        return False
-
-    # 时间戳：用关节帧的时间戳
-    timestamps = [f.get("timestamp", 0.0) for f in pose_frames]
 
     # 创建 HDF5
     hdf5_path = output_dir / f"{session_id}.hdf5"
@@ -224,6 +327,10 @@ def process_session(data_dir: Path, output_dir: Path, fmt: str) -> bool:
         h5.attrs["robot_type"] = "W1_Pro"
         h5.attrs["sample_rate"] = 30.0
 
+        # 参考相机时间戳转纳秒（所有相机和关节共用）
+        ref_ts_ns = np.array(
+            [unix_to_uint64_ns(ts) for ts in ref_timestamps], dtype=np.uint64)
+
         # === 相机数据 ===
         for cam_type in selected_cameras:
             cam_entries = camera_groups[cam_type]
@@ -234,11 +341,9 @@ def process_session(data_dir: Path, output_dir: Path, fmt: str) -> bool:
             # 获取图像尺寸
             shape = None
             if fmt == "jpeg":
-                # 读第一张图片获取尺寸
                 first_path = cam_entries[0].get("image_path", "")
                 shape = get_image_shape(data_dir, first_path)
             else:
-                # video 模式：从 mp4 获取尺寸
                 first_path = cam_entries[0].get("image_path", "")
                 cam_dir = Path(first_path).parent
                 video_path = data_dir / cam_dir / "video.mp4"
@@ -248,20 +353,20 @@ def process_session(data_dir: Path, output_dir: Path, fmt: str) -> bool:
                         shape = (wh[0], wh[1], 3)
 
             if shape is None:
-                shape = (1080, 1920, 3)  # 默认值
+                shape = (1080, 1920, 3)
                 print(f"  [WARN] {cam_type}: 无法获取尺寸，用默认 {shape}")
 
             height, width, channels = shape
             cam_group.attrs["height"] = height
             cam_group.attrs["width"] = width
             cam_group.attrs["channels"] = channels
-            cam_group.attrs["frames"] = len(cam_entries)
+            cam_group.attrs["frames"] = num_frames
             cam_group.attrs["sample_rate"] = 30.0
 
-            # 时间戳
-            cam_ts = [e.get("timestamp", 0.0) for e in cam_entries]
-            cam_ts_ns = np.array([unix_to_uint64_ns(ts) for ts in cam_ts], dtype=np.uint64)
-            cam_group.create_dataset("timestamps", data=cam_ts_ns, compression="gzip", compression_opts=4)
+            # 时间戳（所有相机用参考相机时间戳）
+            cam_group.create_dataset(
+                "timestamps", data=ref_ts_ns, compression="gzip",
+                compression_opts=4)
 
             if fmt == "video":
                 # VIDEO 模式：读整个 mp4 文件作为单个 varlen blob
@@ -285,15 +390,15 @@ def process_session(data_dir: Path, output_dir: Path, fmt: str) -> bool:
                 cam_group.attrs["encoding"] = "jpeg"
                 dt = h5py.vlen_dtype(np.dtype("uint8"))
                 data_ds = cam_group.create_dataset(
-                    "data", shape=(len(cam_entries),), dtype=dt,
-                    compression="gzip", compression_opts=4
-                )
+                    "data", shape=(num_frames,), dtype=dt,
+                    compression="gzip", compression_opts=4)
 
                 for i, entry in enumerate(tqdm(cam_entries, desc=f"  {cam_type}")):
                     image_path = entry.get("image_path", "")
                     full_path = data_dir / image_path
                     if full_path.exists():
-                        data_ds[i] = np.frombuffer(full_path.read_bytes(), dtype=np.uint8)
+                        data_ds[i] = np.frombuffer(
+                            full_path.read_bytes(), dtype=np.uint8)
                     else:
                         data_ds[i] = np.array([], dtype=np.uint8)
 
@@ -304,20 +409,39 @@ def process_session(data_dir: Path, output_dir: Path, fmt: str) -> bool:
         joints_group.attrs["sample_rate"] = 30.0
         joints_group.attrs["columns"] = json.dumps(joint_keys)
 
-        # 关节数据矩阵
-        qpos = np.zeros((num_frames, len(joint_keys)), dtype=np.float32)
-        for i, frame in enumerate(pose_frames):
-            data = frame.get("data", {})
-            for j, key in enumerate(joint_keys):
-                qpos[i, j] = data.get(key, 0.0)
-        joints_group.create_dataset("data", data=qpos, compression="gzip", compression_opts=4)
+        joints_group.create_dataset(
+            "data", data=qpos_interp, compression="gzip", compression_opts=4)
+        joints_group.create_dataset(
+            "timestamps", data=ref_ts_ns, compression="gzip",
+            compression_opts=4)
 
-        # 时间戳
-        ts_ns = np.array([unix_to_uint64_ns(ts) for ts in timestamps], dtype=np.uint64)
-        joints_group.create_dataset("timestamps", data=ts_ns, compression="gzip", compression_opts=4)
+        # === 原始辅助文件存储（反转工具依赖） ===
+        # metadata.jsonl：整体存为 bytes dataset
+        metadata_path = data_dir / "metadata.jsonl"
+        if metadata_path.is_file():
+            with open(metadata_path, "rb") as mf:
+                h5.create_dataset(
+                    "metadata_jsonl",
+                    data=np.frombuffer(mf.read(), dtype=np.uint8))
+
+        # tactile.jsonl：存在则存，不存在跳过
+        tactile_path = data_dir / "tactile.jsonl"
+        if tactile_path.is_file():
+            with open(tactile_path, "rb") as tf:
+                h5.create_dataset(
+                    "tactile_jsonl",
+                    data=np.frombuffer(tf.read(), dtype=np.uint8))
+
+        # subdirs：扫描录制目录所有子目录相对路径（含空目录如 hand/left）
+        subdirs = []
+        for p in sorted(data_dir.rglob("*")):
+            if p.is_dir():
+                subdirs.append(str(p.relative_to(data_dir)))
+        h5.attrs["subdirs"] = json.dumps(subdirs)
 
     file_size = hdf5_path.stat().st_size / (1024 * 1024)
-    print(f"  ✓ {session_id}: {num_frames} 帧, {len(selected_cameras)} 相机, {file_size:.1f}MB")
+    print(f"  ✓ {session_id}: {num_frames} 帧, {len(selected_cameras)} 相机, "
+          f"{file_size:.1f}MB")
     return True
 
 
