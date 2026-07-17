@@ -38,6 +38,14 @@ rm -f "$TAR_PATH"
 echo "[INFO] 正在打包 install 目录为 install.tar.gz..."
 tar -czf "$TAR_PATH" -C "$WORKSPACE_DIR" install
 
+# 同时打包 dexe_recorder.tar（只含 install/dexe_recorder，部署用）
+DEXE_TAR_PATH="${OUTPUT_DIR}/dexe_recorder.tar"
+rm -f "$DEXE_TAR_PATH"
+echo "[INFO] 正在打包 dexe_recorder.tar..."
+tar -cf "$DEXE_TAR_PATH" -C "${WORKSPACE_DIR}/install" dexe_recorder
+
 # === 5. 完成 ===
 echo "[OK] 编译完成并打包成功！"
-echo "[INFO] 输出路径：$TAR_PATH"
+echo "[INFO] 输出路径："
+echo "       $TAR_PATH"
+echo "       $DEXE_TAR_PATH"

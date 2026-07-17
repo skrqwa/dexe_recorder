@@ -68,6 +68,11 @@ install(PROGRAMS scripts/run_recorder.sh scripts/recorderctl.sh scripts/convert_
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(DIRECTORY scripts/hdf5_to_raw_toolkit
+  DESTINATION share/${PROJECT_NAME}/scripts
+  USE_SOURCE_PERMISSIONS
+)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()

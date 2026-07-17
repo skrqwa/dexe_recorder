@@ -11,6 +11,11 @@
 #   ├── run_recorder.sh        # 启动录制
 #   ├── convert_to_hdf5.sh     # 转 HDF5
 #   ├── convert_to_hdf5.py     # 转换脚本
+#   ├── scripts/
+#   │   └── hdf5_to_raw_toolkit/  # HDF5 反转工具
+#   │       ├── hdf5_to_raw.py
+#   │       ├── hdf5_to_raw.sh
+#   │       └── image_video_encode.py
 #   ├── config/
 #   │   └── auto_recorder.yaml # 配置文件（可修改）
 #   ├── data/                   # 录制数据（自动创建）
@@ -51,6 +56,13 @@ cp "$SCRIPT_DIR/convert_to_hdf5.sh" "$DEPLOY_DIR/"
 cp "$SCRIPT_DIR/convert_to_hdf5.py" "$DEPLOY_DIR/"
 cp "$SCRIPT_DIR/config/auto_recorder.yaml" "$DEPLOY_DIR/config/"
 
+# 拷贝反转工具
+if [ -d "$SCRIPT_DIR/scripts/hdf5_to_raw_toolkit" ]; then
+  mkdir -p "$DEPLOY_DIR/scripts/hdf5_to_raw_toolkit"
+  cp -r "$SCRIPT_DIR/scripts/hdf5_to_raw_toolkit/"* "$DEPLOY_DIR/scripts/hdf5_to_raw_toolkit/"
+  chmod +x "$DEPLOY_DIR/scripts/hdf5_to_raw_toolkit/hdf5_to_raw.sh" 2>/dev/null || true
+fi
+
 chmod +x "$DEPLOY_DIR/run_recorder.sh" "$DEPLOY_DIR/recorderctl.sh" "$DEPLOY_DIR/convert_to_hdf5.sh"
 
 # 确保可执行文件有执行权限（tar 解压可能丢失权限）
@@ -70,6 +82,7 @@ echo "  2. 开始录制:  ./recorderctl.sh start"
 echo "  3. 停止录制:  ./recorderctl.sh stop"
 echo "  4. 查询状态:  ./recorderctl.sh status"
 echo "  5. 转 HDF5:  cd ~/workspace/dexe_recorder && ./convert_to_hdf5.sh"
+echo "  6. 反转 HDF5: cd ~/workspace/dexe_recorder && ./scripts/hdf5_to_raw_toolkit/hdf5_to_raw.sh hdf5/xxx.hdf5 restored/"
 echo ""
 echo "数据位置："
 echo "  录制数据: ~/workspace/dexe_recorder/data/"
