@@ -5,14 +5,14 @@
 
 set -e
 
-# 检测并杀掉已有实例
-EXISTING_PID=$(pgrep -f "dexe_recorder_node" 2>/dev/null | head -1)
-if [ -n "$EXISTING_PID" ]; then
-  echo "[INFO] 发现已有实例运行 (PID=$EXISTING_PID)，正在停止..."
-  kill "$EXISTING_PID" 2>/dev/null
+# 检测并杀掉已有实例（含 ros2 run launcher 和节点进程）
+EXISTING_PIDS=$(pgrep -f "dexe_recorder_node" 2>/dev/null)
+if [ -n "$EXISTING_PIDS" ]; then
+  echo "[INFO] 发现已有实例运行 (PID=$EXISTING_PIDS)，正在停止..."
+  echo "$EXISTING_PIDS" | xargs kill 2>/dev/null
   sleep 2
-  # 如果还没退出，强制杀
-  kill -9 "$EXISTING_PID" 2>/dev/null || true
+  # 如果还没退出，强制杀所有
+  echo "$EXISTING_PIDS" | xargs kill -9 2>/dev/null || true
   echo "[INFO] 旧实例已停止"
 fi
 
