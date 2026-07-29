@@ -19,8 +19,10 @@
 #include <vector>
 
 #include "dexe_recorder/gst_recorder.h"
-#include "end_effector_interfaces/msg/ee_feedback.hpp"
 #include "end_effector_interfaces/msg/ee_joint_control.hpp"
+#ifdef USE_EE_FEEDBACK
+#include "end_effector_interfaces/msg/ee_feedback.hpp"
+#endif
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/compressed_image.hpp"
 #include "sensor_msgs/msg/image.hpp"
@@ -131,8 +133,8 @@ struct RecorderConfig
     std::string head_compressed_topic = "/camera/kfc_compressed";     ///< 头部相机话题（~27Hz JPEG）
     std::string hand_left_topic = "/camera_l/color/image_rect_raw";   ///< 手部左相机话题（~30Hz）
     std::string hand_right_topic = "/camera_r/color/image_rect_raw";  ///< 手部右相机话题（~30Hz）
-    std::string ee_left_topic = "/control/ee/left";                   ///< EE 反馈左话题（~20Hz）
-    std::string ee_right_topic = "/control/ee/right";                 ///< EE 反馈右话题（~20Hz）
+    std::string ee_left_topic = "/feedback/ee/left";                ///< EE 反馈左话题（~20Hz）
+    std::string ee_right_topic = "/feedback/ee/right";              ///< EE 反馈右话题（~20Hz）
 
     // 存储路径
     std::string output_dir = "data/recorded_auto";  ///< 输出目录
@@ -208,7 +210,9 @@ private:
      * @brief EE 反馈回调（~20Hz），更新 latest_ee_values_（经关节名映射）
      * @param side "left" 或 "right"
      */
+#ifdef USE_EE_FEEDBACK
     void OnEndEffector(const std::string& side, const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg);
+#endif
 
     /**
      * @brief EE 命令回调（事件驱动），更新 latest_ee_cmd_values_
@@ -291,8 +295,10 @@ private:
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr state_sub_;                        ///< 关节状态订阅
     rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr head_compressed_sub_;  ///< 头部相机订阅
     std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subs_;        ///< 手部相机订阅列表
+#ifdef USE_EE_FEEDBACK
     rclcpp::Subscription<end_effector_interfaces::msg::EEFeedback>::SharedPtr ee_left_sub_;   ///< EE 反馈左订阅
     rclcpp::Subscription<end_effector_interfaces::msg::EEFeedback>::SharedPtr ee_right_sub_;  ///< EE 反馈右订阅
+#endif
     rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_cmd_left_sub_;   ///< EE 命令左订阅
     rclcpp::Subscription<end_effector_interfaces::msg::EEJointControl>::SharedPtr ee_cmd_right_sub_;  ///< EE 命令右订阅
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;                                    ///< 开始录制服务

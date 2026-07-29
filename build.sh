@@ -28,7 +28,11 @@ fi
 
 # === 3. 编译 ===
 echo "[INFO] 开始 colcon build ..."
-colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
+# USE_EE_FEEDBACK: 是否编译末端工具反馈（EEFeedback.msg）支持
+#   ON  - 订阅 /feedback/ee/*，录末端工具反馈数据（需要新版 end_effector_interfaces）
+#   OFF - 不订阅末端工具反馈，feedback_record 只有关节数据（兼容旧版接口包）
+# 编译时可通过环境变量覆盖：USE_EE_FEEDBACK=OFF ./build.sh
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release -DUSE_EE_FEEDBACK=${USE_EE_FEEDBACK:-ON}
 
 # === 4. 打包 install 目录 ===
 mkdir -p "$OUTPUT_DIR"

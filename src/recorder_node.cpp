@@ -118,14 +118,18 @@ RecorderNode::RecorderNode(const rclcpp::NodeOptions& options) : rclcpp::Node("d
         qos,
         [this](const sensor_msgs::msg::Image::ConstSharedPtr msg) { OnImage("hand_right", msg); }));
 
+    // EE 反馈订阅（录 feedback_record 用，需要 EEFeedback.msg 支持）
+#ifdef USE_EE_FEEDBACK
     ee_left_sub_ = this->create_subscription<end_effector_interfaces::msg::EEFeedback>(
-        config_.ee_left_topic,
-        qos,
+        config_.ee_left_topic, qos,
         [this](const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg) { OnEndEffector("left", msg); });
     ee_right_sub_ = this->create_subscription<end_effector_interfaces::msg::EEFeedback>(
-        config_.ee_right_topic,
-        qos,
+        config_.ee_right_topic, qos,
         [this](const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg) { OnEndEffector("right", msg); });
+    RCLCPP_INFO(this->get_logger(), "EE feedback subscribed: %s, %s", config_.ee_left_topic.c_str(), config_.ee_right_topic.c_str());
+#else
+    RCLCPP_INFO(this->get_logger(), "EE feedback disabled (compiled without USE_EE_FEEDBACK)");
+#endif
 
     // EE 命令订阅（录 pose_record 用）
     ee_cmd_left_sub_ = this->create_subscription<end_effector_interfaces::msg::EEJointControl>(
@@ -433,7 +437,7 @@ void RecorderNode::OnImage(const std::string& camera_name, const sensor_msgs::ms
         }
     }
 }
-
+#ifdef USE_EE_FEEDBACK
 void RecorderNode::OnEndEffector(const std::string& side,
                                  const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg)
 {
@@ -502,6 +506,7 @@ std::string RecorderNode::MapEeJointName(const std::string& side,
     // DexHand_021S）：直接加前缀
     return prefix + joint_name;
 }
+#endif  // USE_EE_FEEDBACK
 
 void RecorderNode::OnEeCommand(const std::string& side,
                                const end_effector_interfaces::msg::EEJointControl::ConstSharedPtr msg)

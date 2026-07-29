@@ -24,6 +24,13 @@ find_package(nlohmann_json REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
 
+# EEFeedback 消息支持（编译环境有 EEFeedback.msg 时启用，否则禁用）
+# PC1 编译默认启用，PC2 旧接口包可手动 -DUSE_EE_FEEDBACK=OFF 关闭
+option(USE_EE_FEEDBACK "Enable EEFeedback message support" ON)
+if(USE_EE_FEEDBACK)
+  message(STATUS "EEFeedback support enabled (use -DUSE_EE_FEEDBACK=OFF to disable)")
+endif()
+
 add_executable(dexe_recorder_node
   src/dexe_recorder_node.cpp
   src/recorder_node.cpp
@@ -35,6 +42,10 @@ target_include_directories(dexe_recorder_node PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+if(USE_EE_FEEDBACK)
+  target_compile_definitions(dexe_recorder_node PRIVATE USE_EE_FEEDBACK)
+endif()
 
 ament_target_dependencies(dexe_recorder_node
   rclcpp
