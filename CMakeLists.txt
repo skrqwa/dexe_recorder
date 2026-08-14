@@ -75,7 +75,7 @@ install(DIRECTORY config
   DESTINATION share/${PROJECT_NAME}
 )
 
-install(PROGRAMS scripts/run_recorder.sh scripts/recorderctl.sh scripts/convert_to_hdf5.sh scripts/convert_to_hdf5.py deploy.sh
+install(PROGRAMS scripts/run_recorder.sh scripts/recorderctl.sh scripts/convert_to_hdf5.sh scripts/convert_to_hdf5.py scripts/video_pipeline.py deploy.sh
   DESTINATION share/${PROJECT_NAME}
 )
 

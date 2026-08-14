@@ -23,6 +23,7 @@
 #include <ctime>
 #include <filesystem>
 #include <nlohmann/json.hpp>
+#include <system_error>
 
 namespace dexe_recorder
 {
@@ -33,6 +34,13 @@ using std::placeholders::_2;
 
 // ============================ RecorderConfig ============================
 
+/**
+ * @brief 从 YAML 文件加载录制配置，读取失败时保留默认值
+ * @param path YAML 配置文件路径
+ * @return
+ * 加载后的录制配置
+ * @throws 不抛出异常
+ */
 RecorderConfig RecorderConfig::Load(const std::string& path)
 {
     RecorderConfig cfg;
@@ -59,6 +67,13 @@ RecorderConfig RecorderConfig::Load(const std::string& path)
 
 // ============================ RecorderNode ============================
 
+/**
+ * @brief 构造 recorder 节点并创建话题订阅和控制服务
+ * @param options ROS2 节点选项
+ * @return 构造完成的
+ * recorder 节点
+ * @throws std::exception ROS2 接口创建、路径或内存分配失败
+ */
 RecorderNode::RecorderNode(const rclcpp::NodeOptions& options) : rclcpp::Node("dexe_recorder", options)
 {
     // 加载配置优先级：参数指定 > ~/workspace/dexe_recorder/config > 包 share 目录
@@ -121,12 +136,17 @@ RecorderNode::RecorderNode(const rclcpp::NodeOptions& options) : rclcpp::Node("d
     // EE 反馈订阅（录 feedback_record 用，需要 EEFeedback.msg 支持）
 #ifdef USE_EE_FEEDBACK
     ee_left_sub_ = this->create_subscription<end_effector_interfaces::msg::EEFeedback>(
-        config_.ee_left_topic, qos,
+        config_.ee_left_topic,
+        qos,
         [this](const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg) { OnEndEffector("left", msg); });
     ee_right_sub_ = this->create_subscription<end_effector_interfaces::msg::EEFeedback>(
-        config_.ee_right_topic, qos,
+        config_.ee_right_topic,
+        qos,
         [this](const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg) { OnEndEffector("right", msg); });
-    RCLCPP_INFO(this->get_logger(), "EE feedback subscribed: %s, %s", config_.ee_left_topic.c_str(), config_.ee_right_topic.c_str());
+    RCLCPP_INFO(this->get_logger(),
+                "EE feedback subscribed: %s, %s",
+                config_.ee_left_topic.c_str(),
+                config_.ee_right_topic.c_str());
 #else
     RCLCPP_INFO(this->get_logger(), "EE feedback disabled (compiled without USE_EE_FEEDBACK)");
 #endif
@@ -152,14 +172,35 @@ RecorderNode::RecorderNode(const rclcpp::NodeOptions& options) : rclcpp::Node("d
     RCLCPP_INFO(this->get_logger(), "dexe_recorder ready. state_topic=%s", config_.state_topic.c_str());
 }
 
+/**
+ * @brief 析构 recorder 节点并停止仍在进行的录制
+ * @return 无
+ * @throws 不抛出异常
+ */
 RecorderNode::~RecorderNode()
 {
     if (recording_.load())
     {
-        StopRecording();
+        try
+        {
+            StopRecording();
+        }
+        catch (const std::exception& error)
+        {
+            RCLCPP_ERROR(this->get_logger(), "[RECORDER_DESTRUCTOR_STOP_FAILED] error=%s", error.what());
+        }
+        catch (...)
+        {
+            RCLCPP_ERROR(this->get_logger(), "[RECORDER_DESTRUCTOR_STOP_FAILED] error=unknown");
+        }
     }
 }
 
+/**
+ * @brief 创建 session 并启动 action、feedback 与相机录制
+ * @return true 启动成功；false 已在录制或初始化失败
+ * @throws std::filesystem::filesystem_error 创建 session 目录失败
+ */
 bool RecorderNode::StartRecording()
 {
     if (recording_.load())
@@ -191,13 +232,7 @@ bool RecorderNode::StartRecording()
         return false;
     }
 
-    // 创建相机目录（图片模式时 GStreamer 会用到）
-    for (const auto& sub : {"head/left", "head/right", "hand/left", "hand/right"})
-    {
-        std::filesystem::create_directories(current_session_dir_ + "/" + sub);
-    }
-
-    // 初始化 GStreamer 录制器
+    // 初始化 GStreamer 录制器；各相机 pipeline 和目录在首帧成功到达时懒创建
     auto fmt = (config_.save_format == "jpeg") ? GstRecorder::Format::JPEG : GstRecorder::Format::VIDEO;
     gst_recorder_ = std::make_unique<GstRecorder>();
     if (!gst_recorder_->Start(current_session_dir_, fmt))
@@ -210,6 +245,8 @@ bool RecorderNode::StartRecording()
     }
 
     frame_counter_.store(0);
+    action_writer_failed_.store(false);
+    feedback_writer_failed_.store(false);
     image_frame_counter_.store(0);
     head_left_counter_.store(0);
     head_right_counter_.store(0);
@@ -219,6 +256,7 @@ bool RecorderNode::StartRecording()
     pose_frames_.clear();
     {
         std::lock_guard<std::mutex> lk(latest_state_mtx_);
+        latest_state_frame_ = Frame{};
         latest_ee_values_.clear();
         latest_ee_cmd_values_.clear();
         ee_left_name_.clear();
@@ -250,6 +288,12 @@ bool RecorderNode::StartRecording()
     return true;
 }
 
+/**
+ * @brief 停止写线程和相机 pipeline，并完成 session 文件
+ * @return true 全部产物收尾成功；false 未在录制或任一产物收尾失败
+ * @throws std::bad_alloc 日志、路径或 JSON 分配失败
+ * @throws std::system_error 写线程 join 失败
+ */
 bool RecorderNode::StopRecording()
 {
     if (!recording_.load())
@@ -274,29 +318,61 @@ bool RecorderNode::StopRecording()
     session_end_time_ = this->now().seconds();
 
     // 停止 GStreamer 录制（flush pipeline + 写文件）
+    bool media_finalized = true;
     if (gst_recorder_)
     {
-        gst_recorder_->Stop();
+        media_finalized = gst_recorder_->Stop();
         gst_recorder_.reset();
     }
 
+    bool stream_files_finalized = true;
     if (pose_file_.is_open())
     {
+        pose_file_.flush();
         pose_file_.close();
+        if (pose_file_.fail())
+        {
+            action_writer_failed_.store(true);
+            stream_files_finalized = false;
+        }
     }
     if (feedback_file_.is_open())
     {
+        feedback_file_.flush();
         feedback_file_.close();
+        if (feedback_file_.fail())
+        {
+            feedback_writer_failed_.store(true);
+            stream_files_finalized = false;
+        }
     }
     if (metadata_file_.is_open())
     {
+        metadata_file_.flush();
         metadata_file_.close();
+        if (metadata_file_.fail()) stream_files_finalized = false;
     }
 
     // 合并临时 JSONL 为 tele 兼容的 JSON 格式
-    FinalizePoseRecord();
-    FinalizeFeedbackRecord();
+    bool pose_finalized = FinalizePoseRecord();
+    bool feedback_finalized = FinalizeFeedbackRecord();
 
+    if (!media_finalized || !stream_files_finalized || !pose_finalized || !feedback_finalized ||
+        action_writer_failed_.load() || feedback_writer_failed_.load())
+    {
+        RCLCPP_ERROR(this->get_logger(),
+                     "[RECORDER_FINALIZE_FAILED] session=%s frames=%lu media_ok=%d stream_ok=%d "
+                     "pose_ok=%d feedback_ok=%d action_writer_ok=%d feedback_writer_ok=%d",
+                     current_session_.c_str(),
+                     frame_counter_.load(),
+                     static_cast<int>(media_finalized),
+                     static_cast<int>(stream_files_finalized),
+                     static_cast<int>(pose_finalized),
+                     static_cast<int>(feedback_finalized),
+                     static_cast<int>(!action_writer_failed_.load()),
+                     static_cast<int>(!feedback_writer_failed_.load()));
+        return false;
+    }
     RCLCPP_INFO(this->get_logger(),
                 "Recording STOPPED: session=%s, frames=%lu",
                 current_session_.c_str(),
@@ -304,22 +380,73 @@ bool RecorderNode::StopRecording()
     return true;
 }
 
+/**
+ * @brief 处理 start_recording Trigger 服务
+ * @param req 空 Trigger 请求
+ * @param res 返回启动状态和 session
+ * @return 无
+ * @throws 不抛出异常
+ */
 void RecorderNode::HandleStart(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
                                std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
-    bool ok = StartRecording();
-    res->success = ok;
-    res->message = ok ? ("session=" + current_session_) : "already recording or failed";
+    try
+    {
+        bool ok = StartRecording();
+        res->success = ok;
+        res->message = ok ? ("session=" + current_session_) : "already recording or failed";
+    }
+    catch (const std::exception& error)
+    {
+        RCLCPP_ERROR(this->get_logger(), "[RECORDER_START_FAILED] error=%s", error.what());
+        res->success = false;
+        res->message = std::string("start failed: ") + error.what();
+    }
+    catch (...)
+    {
+        RCLCPP_ERROR(this->get_logger(), "[RECORDER_START_FAILED] error=unknown");
+        res->success = false;
+        res->message = "start failed: unknown exception";
+    }
 }
 
+/**
+ * @brief 处理 stop_recording Trigger 服务
+ * @param req 空 Trigger 请求
+ * @param res 返回停止状态和 session
+ * @return 无
+ * @throws 不抛出异常
+ */
 void RecorderNode::HandleStop(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
                               std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
-    bool ok = StopRecording();
-    res->success = ok;
-    res->message = ok ? ("session=" + current_session_) : "not recording";
+    try
+    {
+        bool ok = StopRecording();
+        res->success = ok;
+        res->message = ok ? ("session=" + current_session_) : "not recording or media finalize failed";
+    }
+    catch (const std::exception& error)
+    {
+        RCLCPP_ERROR(this->get_logger(), "[RECORDER_STOP_FAILED] error=%s", error.what());
+        res->success = false;
+        res->message = std::string("stop failed: ") + error.what();
+    }
+    catch (...)
+    {
+        RCLCPP_ERROR(this->get_logger(), "[RECORDER_STOP_FAILED] error=unknown");
+        res->success = false;
+        res->message = "stop failed: unknown exception";
+    }
 }
 
+/**
+ * @brief 处理 get_status Trigger 服务
+ * @param req 空 Trigger 请求
+ * @param res 返回当前录制状态
+ * @return 无
+ * @throws 不抛出异常
+ */
 void RecorderNode::HandleStatus(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
                                 std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
@@ -329,115 +456,229 @@ void RecorderNode::HandleStatus(const std::shared_ptr<std_srvs::srv::Trigger::Re
                        : "idle";
 }
 
+/**
+ * @brief 解析 robot_server_state 并更新最新 action/feedback 快照
+ * @param msg robot_server_state JSON 消息
+ * @return 无
+ * @throws 不抛出异常
+ */
 void RecorderNode::OnState(const std_msgs::msg::String::ConstSharedPtr msg)
 {
-    if (!recording_.load())
+    try
     {
-        return;
-    }
+        if (!recording_.load())
+        {
+            return;
+        }
 
-    Frame frame;
-    frame.timestamp = this->now().seconds();
-    if (!ParseStateJson(msg->data, &frame))
-    {
-        return;
-    }
+        Frame frame;
+        frame.timestamp = this->now().seconds();
+        if (!ParseStateJson(msg->data, &frame))
+        {
+            return;
+        }
 
-    // 缓存最新关节状态（供 30Hz 写线程取快照）
+        // 缓存最新关节状态（供 30Hz 写线程取快照）
+        {
+            std::lock_guard<std::mutex> lk(latest_state_mtx_);
+            latest_state_frame_ = frame;
+        }
+    }
+    catch (const std::exception& error)
     {
-        std::lock_guard<std::mutex> lk(latest_state_mtx_);
-        latest_state_frame_ = frame;
+        RCLCPP_ERROR_THROTTLE(this->get_logger(),
+                              *this->get_clock(),
+                              5000,
+                              "[RECORDER_CALLBACK_FAILED] camera=state error=%s",
+                              error.what());
+    }
+    catch (...)
+    {
+        RCLCPP_ERROR_THROTTLE(
+            this->get_logger(), *this->get_clock(), 5000, "[RECORDER_CALLBACK_FAILED] camera=state error=unknown");
     }
 }
 
+/**
+ * @brief 头部相机回调，成功推入录制 pipeline 后写左右目 metadata
+ * @param msg 头部左右目并排 JPEG 消息
+ *
+ * @return 无
+ * @throws 不抛出异常
+ */
 void RecorderNode::OnCompressedImage(const sensor_msgs::msg::CompressedImage::ConstSharedPtr msg)
 {
-    if (!recording_.load() || !gst_recorder_)
+    try
     {
-        return;
-    }
-    // 推入 GStreamer pipeline（nvjpegdec 硬解 -> videocrop 拆分 -> 编码保存）
-    gst_recorder_->PushCompressedFrame(msg->data.data(), msg->data.size());
-
-    // 写 metadata.jsonl：左右目各自独立连续下标（与 tele 一致）
-    double ts = this->now().seconds();
-    uint64_t fid = image_frame_counter_.fetch_add(1);
-    uint64_t left_idx = head_left_counter_.fetch_add(1);
-    uint64_t right_idx = head_right_counter_.fetch_add(1);
-
-    char left_name[32], right_name[32];
-    std::snprintf(left_name, sizeof(left_name), "%06lu", left_idx);
-    std::snprintf(right_name, sizeof(right_name), "%06lu", right_idx);
-
-    json meta_left;
-    meta_left["timestamp"] = ts;
-    meta_left["frame_id"] = fid;
-    meta_left["camera_type"] = "head_left";
-    meta_left["ros_timestamp"] = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
-    meta_left["image_path"] = std::string("head/left/") + left_name + ".jpg";
-
-    json meta_right;
-    meta_right["timestamp"] = ts;
-    meta_right["frame_id"] = fid;
-    meta_right["camera_type"] = "head_right";
-    meta_right["ros_timestamp"] = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
-    meta_right["image_path"] = std::string("head/right/") + right_name + ".jpg";
-
-    {
-        std::lock_guard<std::mutex> lk(image_mtx_);
-        if (metadata_file_.is_open())
+        if (!recording_.load() || !gst_recorder_)
         {
-            metadata_file_ << meta_left.dump() << "\n";
-            metadata_file_ << meta_right.dump() << "\n";
-            metadata_file_.flush();
+            return;
         }
+        int64_t source_timestamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+        if (source_timestamp_ns <= 0)
+        {
+            source_timestamp_ns = this->now().nanoseconds();
+        }
+        // 推入 GStreamer pipeline（nvjpegdec 硬解 -> videocrop 拆分 -> 编码保存）
+        if (!gst_recorder_->PushCompressedFrame(
+                msg->data.data(), msg->data.size(), static_cast<uint64_t>(source_timestamp_ns)))
+        {
+            RCLCPP_ERROR_THROTTLE(
+                this->get_logger(), *this->get_clock(), 5000, "[RECORDER_FRAME_REJECTED] camera=head");
+            return;
+        }
+
+        // 写 metadata.jsonl：左右目各自独立连续下标（与 tele 一致）
+        double ts = this->now().seconds();
+        uint64_t fid = image_frame_counter_.fetch_add(1);
+        uint64_t left_idx = head_left_counter_.fetch_add(1);
+        uint64_t right_idx = head_right_counter_.fetch_add(1);
+
+        char left_name[32], right_name[32];
+        std::snprintf(left_name, sizeof(left_name), "%06lu", left_idx);
+        std::snprintf(right_name, sizeof(right_name), "%06lu", right_idx);
+
+        json meta_left;
+        meta_left["timestamp"] = ts;
+        meta_left["frame_id"] = fid;
+        meta_left["camera_type"] = "head_left";
+        meta_left["ros_timestamp"] = static_cast<double>(source_timestamp_ns) / 1e9;
+        meta_left["image_path"] = std::string("head/left/") + left_name + ".jpg";
+
+        json meta_right;
+        meta_right["timestamp"] = ts;
+        meta_right["frame_id"] = fid;
+        meta_right["camera_type"] = "head_right";
+        meta_right["ros_timestamp"] = static_cast<double>(source_timestamp_ns) / 1e9;
+        meta_right["image_path"] = std::string("head/right/") + right_name + ".jpg";
+
+        {
+            std::lock_guard<std::mutex> lk(image_mtx_);
+            if (metadata_file_.is_open())
+            {
+                metadata_file_ << meta_left.dump() << "\n";
+                metadata_file_ << meta_right.dump() << "\n";
+                metadata_file_.flush();
+            }
+        }
+    }
+    catch (const std::exception& error)
+    {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(),
+                              *this->get_clock(),
+                              5000,
+                              "[RECORDER_CALLBACK_FAILED] camera=head error=%s",
+                              error.what());
+    }
+    catch (...)
+    {
+        RCLCPP_ERROR_THROTTLE(
+            this->get_logger(), *this->get_clock(), 5000, "[RECORDER_CALLBACK_FAILED] camera=head error=unknown");
     }
 }
 
+/**
+ * @brief 手部相机回调，成功推入录制 pipeline 后写该相机 metadata
+ * @param camera_name 相机名称（"hand_left"
+ * 或 "hand_right"）
+ * @param msg ROS 原始图像消息
+ * @return 无
+ * @throws 不抛出异常
+ */
 void RecorderNode::OnImage(const std::string& camera_name, const sensor_msgs::msg::Image::ConstSharedPtr msg)
 {
-    if (!recording_.load() || !gst_recorder_)
+    try
     {
-        return;
-    }
-    // 手部相机 raw Image 推入 GStreamer pipeline
-    gst_recorder_->PushHandFrame(
-        camera_name, msg->data.data(), msg->data.size(), msg->width, msg->height, msg->encoding);
-
-    // 写 metadata.jsonl：各自独立连续下标
-    double ts = this->now().seconds();
-    uint64_t fid = image_frame_counter_.fetch_add(1);
-    uint64_t idx;
-    std::string path_prefix;
-    if (camera_name == "hand_left")
-    {
-        idx = hand_left_counter_.fetch_add(1);
-        path_prefix = "hand/left/";
-    }
-    else
-    {
-        idx = hand_right_counter_.fetch_add(1);
-        path_prefix = "hand/right/";
-    }
-    char name[32];
-    std::snprintf(name, sizeof(name), "%06lu", idx);
-
-    json meta;
-    meta["timestamp"] = ts;
-    meta["frame_id"] = fid;
-    meta["camera_type"] = camera_name;
-    meta["ros_timestamp"] = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
-    meta["image_path"] = path_prefix + name + ".jpg";
-    {
-        std::lock_guard<std::mutex> lk(image_mtx_);
-        if (metadata_file_.is_open())
+        if (!recording_.load() || !gst_recorder_)
         {
-            metadata_file_ << meta.dump() << "\n";
-            metadata_file_.flush();
+            return;
         }
+        int64_t source_timestamp_ns = rclcpp::Time(msg->header.stamp).nanoseconds();
+        if (source_timestamp_ns <= 0)
+        {
+            source_timestamp_ns = this->now().nanoseconds();
+        }
+        // 手部相机 raw Image 推入 GStreamer pipeline
+        if (!gst_recorder_->PushHandFrame(camera_name,
+                                          msg->data.data(),
+                                          msg->data.size(),
+                                          msg->width,
+                                          msg->height,
+                                          msg->encoding,
+                                          msg->step,
+                                          static_cast<uint64_t>(source_timestamp_ns)))
+        {
+            RCLCPP_ERROR_THROTTLE(this->get_logger(),
+                                  *this->get_clock(),
+                                  5000,
+                                  "[RECORDER_FRAME_REJECTED] camera=%s encoding=%s width=%u height=%u step=%u",
+                                  camera_name.c_str(),
+                                  msg->encoding.c_str(),
+                                  msg->width,
+                                  msg->height,
+                                  msg->step);
+            return;
+        }
+
+        // 写 metadata.jsonl：各自独立连续下标
+        double ts = this->now().seconds();
+        uint64_t fid = image_frame_counter_.fetch_add(1);
+        uint64_t idx;
+        std::string path_prefix;
+        if (camera_name == "hand_left")
+        {
+            idx = hand_left_counter_.fetch_add(1);
+            path_prefix = "hand/left/";
+        }
+        else
+        {
+            idx = hand_right_counter_.fetch_add(1);
+            path_prefix = "hand/right/";
+        }
+        char name[32];
+        std::snprintf(name, sizeof(name), "%06lu", idx);
+
+        json meta;
+        meta["timestamp"] = ts;
+        meta["frame_id"] = fid;
+        meta["camera_type"] = camera_name;
+        meta["ros_timestamp"] = static_cast<double>(source_timestamp_ns) / 1e9;
+        meta["image_path"] = path_prefix + name + ".jpg";
+        {
+            std::lock_guard<std::mutex> lk(image_mtx_);
+            if (metadata_file_.is_open())
+            {
+                metadata_file_ << meta.dump() << "\n";
+                metadata_file_.flush();
+            }
+        }
+    }
+    catch (const std::exception& error)
+    {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(),
+                              *this->get_clock(),
+                              5000,
+                              "[RECORDER_CALLBACK_FAILED] camera=%s error=%s",
+                              camera_name.c_str(),
+                              error.what());
+    }
+    catch (...)
+    {
+        RCLCPP_ERROR_THROTTLE(this->get_logger(),
+                              *this->get_clock(),
+                              5000,
+                              "[RECORDER_CALLBACK_FAILED] camera=%s error=unknown",
+                              camera_name.c_str());
     }
 }
 #ifdef USE_EE_FEEDBACK
+/**
+ * @brief 更新指定侧末端执行器的实际反馈缓存
+ * @param side "left" 或 "right"
+ * @param msg EE 实际反馈消息
+ * @return 无
+ * @throws std::bad_alloc 更新反馈缓存失败
+ */
 void RecorderNode::OnEndEffector(const std::string& side,
                                  const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg)
 {
@@ -466,6 +707,16 @@ void RecorderNode::OnEndEffector(const std::string& side,
     }
 }
 
+/**
+ * @brief 将 EE 原始关节名映射为 AIRS/W1 关节名
+ * @param side "left" 或 "right"
+ * @param ee_name 末端设备型号
+ * @param joint_name 原始关节名
+ * @return 映射后的关节名
+ * @throws std::bad_alloc
+ * 关节名字符串分配失败
+
+ */
 std::string RecorderNode::MapEeJointName(const std::string& side,
                                          const std::string& ee_name,
                                          const std::string& joint_name) const
@@ -508,6 +759,14 @@ std::string RecorderNode::MapEeJointName(const std::string& side,
 }
 #endif  // USE_EE_FEEDBACK
 
+/**
+ * @brief 更新指定侧末端执行器的动作命令缓存
+ * @param side "left" 或 "right"
+ * @param msg EE 命令消息
+ * @return
+ * 无
+ * @throws std::bad_alloc 更新命令缓存失败
+ */
 void RecorderNode::OnEeCommand(const std::string& side,
                                const end_effector_interfaces::msg::EEJointControl::ConstSharedPtr msg)
 {
@@ -536,123 +795,175 @@ void RecorderNode::OnEeCommand(const std::string& side,
     }
 }
 
+/**
+ * @brief 以 30 Hz 写入包含真实字段的 action 快照
+ * @return 无
+ * @throws 不抛出异常
+ */
 void RecorderNode::WriterLoop()
 {
     // 30Hz 墙钟驱动：取最新命令快照，组装帧写盘
     const double interval = 1.0 / 30.0;
     auto next_t = std::chrono::steady_clock::now() + std::chrono::milliseconds(33);
 
-    while (recording_.load())
+    try
     {
-        std::this_thread::sleep_until(next_t);
-        next_t += std::chrono::microseconds(static_cast<int64_t>(interval * 1e6));
-
-        // 跳帧追齐（被挂起后恢复）
-        auto now = std::chrono::steady_clock::now();
-        if (next_t < now)
+        while (recording_.load())
         {
-            next_t = now + std::chrono::microseconds(static_cast<int64_t>(interval * 1e6));
-        }
+            std::this_thread::sleep_until(next_t);
+            next_t += std::chrono::microseconds(static_cast<int64_t>(interval * 1e6));
 
-        // 取最新命令快照
-        Frame frame;
-        frame.timestamp = this->now().seconds();
-        {
-            std::lock_guard<std::mutex> lk(latest_state_mtx_);
-            frame = latest_state_frame_;
+            // 跳帧追齐（被挂起后恢复）
+            auto now = std::chrono::steady_clock::now();
+            if (next_t < now)
+            {
+                next_t = now + std::chrono::microseconds(static_cast<int64_t>(interval * 1e6));
+            }
+
+            // 取最新命令快照
+            Frame frame;
+            frame.timestamp = this->now().seconds();
+            {
+                std::lock_guard<std::mutex> lk(latest_state_mtx_);
+                frame = latest_state_frame_;
+            }
+            if (WriteFrame(frame))
+            {
+                frame_counter_.fetch_add(1);
+            }
         }
-        WriteFrame(frame);
-        frame_counter_.fetch_add(1);
+    }
+    catch (const std::exception& error)
+    {
+        action_writer_failed_.store(true);
+        RCLCPP_ERROR(this->get_logger(), "[RECORDER_ACTION_WRITER_FAILED] error=%s", error.what());
+    }
+    catch (...)
+    {
+        action_writer_failed_.store(true);
+        RCLCPP_ERROR(this->get_logger(), "[RECORDER_ACTION_WRITER_FAILED] error=unknown");
     }
     RCLCPP_INFO(this->get_logger(), "Writer loop exited");
 }
 
+/**
+ * @brief 以 30 Hz 写入包含真实字段的 feedback 快照
+ * @return 无
+ * @throws 不抛出异常
+ */
 void RecorderNode::FeedbackWriterLoop()
 {
     // 30Hz 独立写线程：取最新反馈快照，组装帧，流式写盘
     const double interval = 1.0 / 30.0;  // 33ms
     auto next_t = std::chrono::steady_clock::now() + std::chrono::milliseconds(33);
 
-    while (feedback_recording_.load())
+    try
     {
-        std::this_thread::sleep_until(next_t);
-        next_t += std::chrono::microseconds(static_cast<int64_t>(interval * 1e6));
-
-        // 跳帧追齐（被挂起后恢复）
-        auto now = std::chrono::steady_clock::now();
-        if (next_t < now)
+        while (feedback_recording_.load())
         {
-            next_t = now + std::chrono::microseconds(static_cast<int64_t>(interval * 1e6));
-        }
+            std::this_thread::sleep_until(next_t);
+            next_t += std::chrono::microseconds(static_cast<int64_t>(interval * 1e6));
 
-        // 取最新反馈快照
-        std::map<std::string, double> joint_map;
-        std::map<std::string, double> ee_map;
-        double ts = this->now().seconds();
-        {
-            std::lock_guard<std::mutex> lk(latest_state_mtx_);
-            // 关节反馈
-            if (!latest_state_frame_.joint_position.empty())
+            // 跳帧追齐（被挂起后恢复）
+            auto now = std::chrono::steady_clock::now();
+            if (next_t < now)
             {
-                for (size_t i = 0;
-                     i < latest_state_frame_.joint_names.size() && i < latest_state_frame_.joint_position.size();
-                     ++i)
+                next_t = now + std::chrono::microseconds(static_cast<int64_t>(interval * 1e6));
+            }
+
+            // 取最新反馈快照
+            std::map<std::string, double> joint_map;
+            std::map<std::string, double> ee_map;
+            double ts = this->now().seconds();
+            {
+                std::lock_guard<std::mutex> lk(latest_state_mtx_);
+                // 关节反馈
+                if (!latest_state_frame_.joint_position.empty())
                 {
-                    joint_map[latest_state_frame_.joint_names[i]] = latest_state_frame_.joint_position[i];
+                    for (size_t i = 0;
+                         i < latest_state_frame_.joint_names.size() && i < latest_state_frame_.joint_position.size();
+                         ++i)
+                    {
+                        joint_map[latest_state_frame_.joint_names[i]] = latest_state_frame_.joint_position[i];
+                    }
+                }
+                // EE 反馈
+                for (const auto& [name, val] : latest_ee_values_)
+                {
+                    ee_map[name] = val;
                 }
             }
-            // EE 反馈
-            for (const auto& [name, val] : latest_ee_values_)
-            {
-                ee_map[name] = val;
-            }
-        }
 
-        // 组装反馈帧
-        nlohmann::ordered_json data;
-        static const std::vector<std::string> kArmOrder = {
-            "ANKLE",    "KNEE",     "BUTTOCK",  "WAIST",    "NECK1",    "NECK2",    "LEFT_J1",
-            "LEFT_J2",  "LEFT_J3",  "LEFT_J4",  "LEFT_J5",  "LEFT_J6",  "LEFT_J7",  "RIGHT_J1",
-            "RIGHT_J2", "RIGHT_J3", "RIGHT_J4", "RIGHT_J5", "RIGHT_J6", "RIGHT_J7",
-        };
-        for (const auto& name : kArmOrder)
-        {
-            auto it = joint_map.find(name);
-            data[name] = (it != joint_map.end()) ? it->second : 0.0;
-        }
-        for (const auto& [name, val] : joint_map)
-        {
-            if (std::find(kArmOrder.begin(), kArmOrder.end(), name) == kArmOrder.end())
+            if (joint_map.empty() && ee_map.empty())
+            {
+                continue;
+            }
+
+            // 组装反馈帧
+            nlohmann::ordered_json data;
+            static const std::vector<std::string> kArmOrder = {
+                "ANKLE",    "KNEE",     "BUTTOCK",  "WAIST",    "NECK1",    "NECK2",    "LEFT_J1",
+                "LEFT_J2",  "LEFT_J3",  "LEFT_J4",  "LEFT_J5",  "LEFT_J6",  "LEFT_J7",  "RIGHT_J1",
+                "RIGHT_J2", "RIGHT_J3", "RIGHT_J4", "RIGHT_J5", "RIGHT_J6", "RIGHT_J7",
+            };
+            for (const auto& name : kArmOrder)
+            {
+                auto it = joint_map.find(name);
+                if (it != joint_map.end())
+                {
+                    data[name] = it->second;
+                }
+            }
+            for (const auto& [name, val] : joint_map)
+            {
+                if (std::find(kArmOrder.begin(), kArmOrder.end(), name) == kArmOrder.end())
+                {
+                    data[name] = val;
+                }
+            }
+            // EE 反馈关节
+            for (const auto& [name, val] : ee_map)
             {
                 data[name] = val;
             }
-        }
-        // EE 反馈关节
-        for (const auto& [name, val] : ee_map)
-        {
-            data[name] = val;
-        }
 
-        nlohmann::ordered_json j;
-        j["frame_id"] = feedback_frame_counter_.fetch_add(1);
-        j["timestamp"] = ts;
-        j["data"] = data;
+            nlohmann::ordered_json j;
+            j["frame_id"] = feedback_frame_counter_.fetch_add(1);
+            j["timestamp"] = ts;
+            j["data"] = data;
 
-        // 流式写盘
-        std::string frame_str = j.dump(2);
-        {
-            std::lock_guard<std::mutex> lk(image_mtx_);
-            feedback_frames_.push_back(frame_str);
+            // 流式写盘
+            std::string frame_str = j.dump(2);
+            {
+                std::lock_guard<std::mutex> lk(image_mtx_);
+                feedback_frames_.push_back(frame_str);
+            }
+            if (feedback_file_.is_open())
+            {
+                feedback_file_ << j.dump() << "\n";
+                feedback_file_.flush();
+            }
         }
-        if (feedback_file_.is_open())
-        {
-            feedback_file_ << j.dump() << "\n";
-            feedback_file_.flush();
-        }
+    }
+    catch (const std::exception& error)
+    {
+        feedback_writer_failed_.store(true);
+        RCLCPP_ERROR(this->get_logger(), "[RECORDER_FEEDBACK_WRITER_FAILED] error=%s", error.what());
+    }
+    catch (...)
+    {
+        feedback_writer_failed_.store(true);
+        RCLCPP_ERROR(this->get_logger(), "[RECORDER_FEEDBACK_WRITER_FAILED] error=unknown");
     }
     RCLCPP_INFO(this->get_logger(), "Feedback writer loop exited");
 }
 
+/**
+ * @brief 生成本地时间格式的 session ID
+ * @return YYYYMMDD_HHMMSS 格式的 session ID
+ * @throws
+ * std::bad_alloc session ID 字符串分配失败
+ */
 std::string RecorderNode::MakeSessionId() const
 {
     std::time_t now = std::time(nullptr);
@@ -663,6 +974,13 @@ std::string RecorderNode::MakeSessionId() const
     return std::string(buf);
 }
 
+/**
+ * @brief 解析 robot_server_state JSON
+ * @param json_str JSON 字符串
+ * @param frame 输出 action/feedback 状态帧
+ * @return true 解析成功；false 输入无效
+ * @throws 不抛出异常
+ */
 bool RecorderNode::ParseStateJson(const std::string& json_str, Frame* frame)
 {
     try
@@ -701,7 +1019,16 @@ bool RecorderNode::ParseStateJson(const std::string& json_str, Frame* frame)
     }
 }
 
-void RecorderNode::WriteFrame(const Frame& frame)
+/**
+ * @brief 组装并写入一帧真实 pose_record 命令数据
+ * @param frame 最新关节状态快照
+ * @return
+ * true 至少包含一个真实命令字段并已写入；false 无数据而跳过
+ * @throws std::bad_alloc JSON
+ * 或缓存分配失败
+
+ */
+bool RecorderNode::WriteFrame(const Frame& frame)
 {
     // pose_record 录制命令数据：joint_position_cmd + EE 命令
     std::map<std::string, double> joint_map;
@@ -722,6 +1049,11 @@ void RecorderNode::WriteFrame(const Frame& frame)
         }
     }
 
+    if (joint_map.empty())
+    {
+        return false;
+    }
+
     // 按遥操顺序输出手臂关节（EE 关节由实际反馈决定，不硬编码占位符）
     static const std::vector<std::string> kArmOrder = {
         "ANKLE",    "KNEE",     "BUTTOCK",  "WAIST",    "NECK1",    "NECK2",    "LEFT_J1",
@@ -734,7 +1066,10 @@ void RecorderNode::WriteFrame(const Frame& frame)
     for (const auto& name : kArmOrder)
     {
         auto it = joint_map.find(name);
-        data[name] = (it != joint_map.end()) ? it->second : 0.0;
+        if (it != joint_map.end())
+        {
+            data[name] = it->second;
+        }
     }
 
     // 输出所有 EE 关节（由 MapEeJointName 映射后的实际反馈数据）
@@ -762,8 +1097,17 @@ void RecorderNode::WriteFrame(const Frame& frame)
         pose_file_ << j.dump() << "\n";
         pose_file_.flush();
     }
+    return true;
 }
 
+/**
+ * @brief 生成相机帧的 session 相对路径
+ * @param camera_type 相机类型
+ * @param frame_id 相机内连续帧号
+ * @return
+ * 相机帧相对路径
+ * @throws std::bad_alloc 路径字符串分配失败
+ */
 std::string RecorderNode::ImagePath(const std::string& camera_type, uint64_t frame_id) const
 {
     // camera_type: "head_left" -> "head/left/000123.jpg"
@@ -784,7 +1128,12 @@ std::string RecorderNode::ImagePath(const std::string& camera_type, uint64_t fra
     return dir + "/" + std::string(seq) + ".jpg";
 }
 
-void RecorderNode::FinalizePoseRecord()
+/**
+ * @brief 合并 action 临时 JSONL 为最终 pose_record JSON
+ * @return true 最终文件写入并关闭成功；false 创建、写入、关闭或清理失败
+ * @throws std::bad_alloc JSON 或路径字符串分配失败
+ */
+bool RecorderNode::FinalizePoseRecord()
 {
     // 合并为 tele 兼容的 pose_record_<sid>.json
     std::string json_path = current_session_dir_ + "/pose_record_" + current_session_ + ".json";
@@ -792,7 +1141,7 @@ void RecorderNode::FinalizePoseRecord()
     if (!out.is_open())
     {
         RCLCPP_ERROR(this->get_logger(), "Failed to write %s", json_path.c_str());
-        return;
+        return false;
     }
 
     json root;
@@ -842,27 +1191,68 @@ void RecorderNode::FinalizePoseRecord()
     out << "  \"metadata\": " << root["metadata"].dump() << ",\n";
     out << "  \"frames\": " << frames_str << "\n";
     out << "}";
+    out.flush();
     out.close();
+    if (out.fail())
+    {
+        RCLCPP_ERROR(this->get_logger(), "Failed to finalize %s", json_path.c_str());
+        return false;
+    }
 
     // 删除临时 JSONL
     std::string tmp_path = current_session_dir_ + "/pose_record_" + current_session_ + ".jsonl.tmp";
-    std::filesystem::remove(tmp_path);
+    std::error_code remove_error;
+    std::filesystem::remove(tmp_path, remove_error);
+    if (remove_error)
+    {
+        RCLCPP_ERROR(this->get_logger(),
+                     "Failed to remove temporary action file %s: %s",
+                     tmp_path.c_str(),
+                     remove_error.message().c_str());
+        return false;
+    }
 
     RCLCPP_INFO(this->get_logger(),
                 "pose_record.json written: %s (%lu frames)",
                 json_path.c_str(),
                 root["frame_count"].get<size_t>());
+    return true;
 }
 
-void RecorderNode::FinalizeFeedbackRecord()
+/**
+ * @brief 合并 feedback 临时 JSONL；没有真实反馈时省略最终文件
+ * @return true 最终文件写入并关闭成功或确实无反馈；false 创建、写入、关闭或清理失败
+ * @throws std::bad_alloc JSON 或路径字符串分配失败
+ */
+bool RecorderNode::FinalizeFeedbackRecord()
 {
+    {
+        std::lock_guard<std::mutex> lk(image_mtx_);
+        if (feedback_frames_.empty())
+        {
+            std::string tmp_path = current_session_dir_ + "/feedback_record_" + current_session_ + ".jsonl.tmp";
+            std::error_code remove_error;
+            std::filesystem::remove(tmp_path, remove_error);
+            if (remove_error)
+            {
+                RCLCPP_ERROR(this->get_logger(),
+                             "Failed to remove temporary feedback file %s: %s",
+                             tmp_path.c_str(),
+                             remove_error.message().c_str());
+                return false;
+            }
+            RCLCPP_WARN(this->get_logger(), "feedback_record omitted: no feedback data received");
+            return true;
+        }
+    }
+
     // 合并为 feedback_record_<sid>.json（与 pose_record 同级目录）
     std::string json_path = current_session_dir_ + "/feedback_record_" + current_session_ + ".json";
     std::ofstream out(json_path, std::ios::out | std::ios::trunc);
     if (!out.is_open())
     {
         RCLCPP_ERROR(this->get_logger(), "Failed to write %s", json_path.c_str());
-        return;
+        return false;
     }
 
     json root;
@@ -907,16 +1297,32 @@ void RecorderNode::FinalizeFeedbackRecord()
     out << "  \"frame_count\": " << root["frame_count"].dump() << ",\n";
     out << "  \"frames\": " << frames_str << "\n";
     out << "}";
+    out.flush();
     out.close();
+    if (out.fail())
+    {
+        RCLCPP_ERROR(this->get_logger(), "Failed to finalize %s", json_path.c_str());
+        return false;
+    }
 
     // 删除临时 JSONL
     std::string tmp_path = current_session_dir_ + "/feedback_record_" + current_session_ + ".jsonl.tmp";
-    std::filesystem::remove(tmp_path);
+    std::error_code remove_error;
+    std::filesystem::remove(tmp_path, remove_error);
+    if (remove_error)
+    {
+        RCLCPP_ERROR(this->get_logger(),
+                     "Failed to remove temporary feedback file %s: %s",
+                     tmp_path.c_str(),
+                     remove_error.message().c_str());
+        return false;
+    }
 
     RCLCPP_INFO(this->get_logger(),
                 "feedback_record.json written: %s (%lu frames)",
                 json_path.c_str(),
                 root["frame_count"].get<size_t>());
+    return true;
 }
 
 }  // namespace dexe_recorder

@@ -37,6 +37,9 @@ namespace dexe_recorder
  *
  * 从 /feedback/robot_server_state 的 JSON 解析而来，
  * 包含关节反馈和指令数据，供 30Hz 写线程取快照使用。
+ *
+ * @return 单帧数据类型
+ * @throws 不抛出异常
  */
 struct Frame
 {
@@ -57,6 +60,10 @@ struct Frame
 
     /**
      * @brief 相机图像数据（按相机名索引）
+     * @return 相机图像数据类型
+     * @throws
+     * 不抛出异常
+
      */
     struct ImageData
     {
@@ -72,6 +79,8 @@ struct Frame
 /**
  * @brief 线程安全的有界帧缓冲队列（生产者-消费者模型）
  * @note 已弃用，改用 30Hz 写线程取最新快照方式，保留兼容
+ * @return 有界帧缓冲类型
+ * @throws 不抛出异常
  */
 class FrameBuffer
 {
@@ -79,6 +88,9 @@ public:
     /**
      * @brief 构造函数
      * @param max_size 队列最大容量（默认 600 帧）
+     * @return 构造完成的帧缓冲
+     *
+     * @throws 不抛出异常
      */
     explicit FrameBuffer(size_t max_size = 600);
 
@@ -86,6 +98,9 @@ public:
      * @brief 生产端：非阻塞推入帧
      * @param frame 要推入的帧（移动语义）
      * @note 队列满时丢弃最旧帧并计数
+     * @return 无
+     * @throws std::bad_alloc 队列扩容失败
+
      */
     void Push(Frame&& frame);
 
@@ -93,24 +108,29 @@ public:
      * @brief 消费端：阻塞等待并取出一帧
      * @param out 输出帧
      * @return true 取到帧；false 队列已停止
+     * @throws 不抛出异常
      */
     bool Pop(Frame* out);
 
-    /** @brief 停止队列，唤醒所有等待的消费者 */
+    /**
+     * @brief 停止队列，唤醒所有等待的消费者
+     * @return 无
+     * @throws 不抛出异常
+
+     */
     void Stop();
 
     /**
      * @brief 获取丢弃帧数
      * @return 被丢弃的帧总数
+     * @throws 不抛出异常
      */
-    size_t dropped_count() const
-    {
-        return dropped_.load();
-    }
+    size_t dropped_count() const;
 
     /**
      * @brief 获取当前队列长度
      * @return 队列中帧的数量
+     * @throws 不抛出异常
      */
     size_t size() const;
 
@@ -125,6 +145,9 @@ private:
 
 /**
  * @brief 录制配置（从 auto_recorder.yaml 加载）
+ * @return 录制配置类型
+ * @throws 不抛出异常
+
  */
 struct RecorderConfig
 {
@@ -133,8 +156,8 @@ struct RecorderConfig
     std::string head_compressed_topic = "/camera/kfc_compressed";     ///< 头部相机话题（~27Hz JPEG）
     std::string hand_left_topic = "/camera_l/color/image_rect_raw";   ///< 手部左相机话题（~30Hz）
     std::string hand_right_topic = "/camera_r/color/image_rect_raw";  ///< 手部右相机话题（~30Hz）
-    std::string ee_left_topic = "/feedback/ee/left";                ///< EE 反馈左话题（~20Hz）
-    std::string ee_right_topic = "/feedback/ee/right";              ///< EE 反馈右话题（~20Hz）
+    std::string ee_left_topic = "/feedback/ee/left";                  ///< EE 反馈左话题（~20Hz）
+    std::string ee_right_topic = "/feedback/ee/right";                ///< EE 反馈右话题（~20Hz）
 
     // 存储路径
     std::string output_dir = "data/recorded_auto";  ///< 输出目录
@@ -150,6 +173,7 @@ struct RecorderConfig
      * @brief 从 YAML 文件加载配置
      * @param path YAML 文件路径
      * @return 加载后的配置，失败时返回默认值
+     * @throws 不抛出异常
      */
     static RecorderConfig Load(const std::string& path);
 };
@@ -164,6 +188,9 @@ struct RecorderConfig
  * - metadata.jsonl：相机帧元数据
  *
  * 架构：ROS 回调只更新内存快照，两个 30Hz 独立写线程取快照流式写盘。
+ *
+ * @return auto 模式录制节点类型
+ * @throws std::exception ROS2 节点资源初始化失败
  */
 class RecorderNode : public rclcpp::Node
 {
@@ -171,44 +198,91 @@ public:
     /**
      * @brief 构造函数
      * @param options ROS2 节点选项
+     * @return 构造完成的 recorder 节点
+     *
+     * @throws std::exception ROS2 接口创建、路径或内存分配失败
      */
     explicit RecorderNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
 
-    /** @brief 析构函数，停止录制并清理资源 */
+    /**
+     * @brief 析构函数，停止录制并清理资源
+     * @return 无
+     * @throws 不抛出异常
+ */
     ~RecorderNode() override;
 
 private:
     // ---- 服务回调 ----
 
-    /** @brief 处理 start_recording 服务请求 */
+    /**
+     * @brief 处理 start_recording 服务请求
+     * @param req 空 Trigger 请求
+     * @param res
+     * 返回启动状态和 session
+     * @return 无
+     * @throws 不抛出异常
+     */
     void HandleStart(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
                      std::shared_ptr<std_srvs::srv::Trigger::Response> res);
 
-    /** @brief 处理 stop_recording 服务请求 */
+    /**
+     * @brief 处理 stop_recording 服务请求
+     * @param req 空 Trigger 请求
+     * @param res
+     * 返回停止状态和 session
+     * @return 无
+     * @throws 不抛出异常
+     */
     void HandleStop(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
                     std::shared_ptr<std_srvs::srv::Trigger::Response> res);
 
-    /** @brief 处理 get_status 服务请求 */
+    /**
+     * @brief 处理 get_status 服务请求
+     * @param req 空 Trigger 请求
+     * @param res 返回当前录制状态
+     * @return 无
+     * @throws 不抛出异常
+     */
     void HandleStatus(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
                       std::shared_ptr<std_srvs::srv::Trigger::Response> res);
 
     // ---- 话题回调（只更新内存快照，不碰磁盘）----
 
-    /** @brief 关节状态回调（~100Hz），解析 JSON 并更新 latest_state_frame_ */
+    /**
+     * @brief 关节状态回调（~100Hz），解析 JSON 并更新 latest_state_frame_
+     * @param msg
+     * robot_server_state JSON 消息
+     * @return 无
+     * @throws 不抛出异常
+     */
     void OnState(const std_msgs::msg::String::ConstSharedPtr msg);
 
     /**
      * @brief 手部相机回调（~30Hz），推入 GStreamer pipeline 并写 metadata
      * @param camera_name "hand_left" 或 "hand_right"
+     * @param msg ROS 原始图像消息
+     * @return 无
+ *
+     * @throws 不抛出异常
      */
     void OnImage(const std::string& camera_name, const sensor_msgs::msg::Image::ConstSharedPtr msg);
 
-    /** @brief 头部相机回调（~27Hz），推入 GStreamer pipeline 并写 metadata */
+    /**
+     * @brief 头部相机回调（~27Hz），推入 GStreamer pipeline 并写 metadata
+     * @param msg 左右目并排
+     * JPEG 消息
+     * @return 无
+     * @throws 不抛出异常
+     */
     void OnCompressedImage(const sensor_msgs::msg::CompressedImage::ConstSharedPtr msg);
 
     /**
      * @brief EE 反馈回调（~20Hz），更新 latest_ee_values_（经关节名映射）
      * @param side "left" 或 "right"
+     * @param msg EE 实际反馈消息
+     * @return 无
+     * @throws
+     * std::bad_alloc 更新反馈缓存失败
      */
 #ifdef USE_EE_FEEDBACK
     void OnEndEffector(const std::string& side, const end_effector_interfaces::msg::EEFeedback::ConstSharedPtr msg);
@@ -217,15 +291,31 @@ private:
     /**
      * @brief EE 命令回调（事件驱动），更新 latest_ee_cmd_values_
      * @param side "left" 或 "right"
+     * @param msg EE 命令消息
+     * @return 无
+     * @throws std::bad_alloc
+     * 更新命令缓存失败
      */
     void OnEeCommand(const std::string& side, const end_effector_interfaces::msg::EEJointControl::ConstSharedPtr msg);
 
     // ---- 30Hz 写盘线程 ----
 
-    /** @brief pose_record 写线程（30Hz），取最新命令快照写盘 */
+    /**
+     * @brief pose_record 写线程（30Hz），取最新命令快照写盘
+     * @return 无
+     * @throws
+     * 不抛出异常
+
+     */
     void WriterLoop();
 
-    /** @brief feedback_record 写线程（30Hz），取最新反馈快照写盘 */
+    /**
+     * @brief feedback_record 写线程（30Hz），取最新反馈快照写盘
+     * @return 无
+     * @throws
+     * 不抛出异常
+
+     */
     void FeedbackWriterLoop();
 
     // ---- 录制会话管理 ----
@@ -233,12 +323,16 @@ private:
     /**
      * @brief 开始录制：创建 session 目录、打开文件、启动写线程
      * @return true 成功；false 已在录制或初始化失败
+     * @throws std::filesystem::filesystem_error 创建
+     * session 目录失败
      */
     bool StartRecording();
 
     /**
      * @brief 停止录制：停写线程、flush pipeline、合并 JSON
-     * @return true 成功；false 未在录制
+     * @return true 全部产物收尾成功；false 未在录制或任一产物收尾失败
+     * @throws std::bad_alloc 日志、路径或 JSON 分配失败
+     * @throws std::system_error 写线程 join 失败
      */
     bool StopRecording();
 
@@ -247,6 +341,7 @@ private:
     /**
      * @brief 生成 session ID（时间戳格式 YYYYMMDD_HHMMSS）
      * @return session ID 字符串
+     * @throws std::bad_alloc session ID 字符串分配失败
      */
     std::string MakeSessionId() const;
 
@@ -255,26 +350,42 @@ private:
      * @param json_str JSON 字符串
      * @param frame 输出帧（填充 joint 字段）
      * @return true 解析成功
+     * @throws 不抛出异常
      */
     bool ParseStateJson(const std::string& json_str, Frame* frame);
 
     /**
      * @brief 组装并写入一帧 pose_record（命令数据）
-     * @param frame 最新关节状态快照（取 joint_position_cmd）
+     * @param frame
+     * 最新关节状态快照（取
+     * joint_position_cmd）
+     * @return true 至少包含一个真实命令字段并已写入；false 无数据而跳过
+     *
+     * @throws std::bad_alloc JSON 或缓存分配失败
      */
-    void WriteFrame(const Frame& frame);
+    bool WriteFrame(const Frame& frame);
 
-    /** @brief 合并临时 JSONL 为最终 pose_record.json */
-    void FinalizePoseRecord();
+    /**
+     * @brief 合并临时 JSONL 为最终 pose_record.json
+     * @return true 最终文件写入并关闭成功；false 创建、写入、关闭或清理失败
+     * @throws std::bad_alloc JSON 或路径字符串分配失败
+     */
+    bool FinalizePoseRecord();
 
-    /** @brief 合并临时 JSONL 为最终 feedback_record.json */
-    void FinalizeFeedbackRecord();
+    /**
+     * @brief 合并临时 JSONL 为最终 feedback_record.json；无真实反馈时省略产物
+     * @return true 最终文件写入并关闭成功或确实无反馈；false 创建、写入、关闭或清理失败
+     * @throws std::bad_alloc JSON 或路径字符串分配失败
+     */
+    bool FinalizeFeedbackRecord();
 
     /**
      * @brief 生成相机图片路径
      * @param camera_type 相机类型（"head_left" 等）
      * @param frame_id 帧序号
      * @return 相对路径（如 "head/left/000123.jpg"）
+     * @throws std::bad_alloc 路径字符串分配失败
+
      */
     std::string ImagePath(const std::string& camera_type, uint64_t frame_id) const;
 
@@ -284,6 +395,8 @@ private:
      * @param ee_name 末端设备型号（如 "Linker_L6"、"BrainCo_Revo1_R"）
      * @param joint_name 原始关节名（如 "T_MCP"）
      * @return 映射后的关节名（如 "LEFT_T_MCP" 或 "LEFT_HAND_THUMB1"）
+     * @throws std::bad_alloc
+     * 关节名字符串分配失败
      */
     std::string MapEeJointName(const std::string& side,
                                const std::string& ee_name,
@@ -307,6 +420,7 @@ private:
 
     // ---- 录制状态 ----
     std::atomic<bool> recording_{false};            ///< 是否正在录制
+    std::atomic<bool> action_writer_failed_{false};  ///< action 写线程是否异常退出
     std::string current_session_;                   ///< 当前 session ID
     std::string current_session_dir_;               ///< 当前 session 目录路径
     std::atomic<uint64_t> frame_counter_{0};        ///< pose_record 帧计数
@@ -332,6 +446,7 @@ private:
     std::ofstream feedback_file_;                      ///< feedback_record 临时 JSONL 文件
     std::thread feedback_writer_thread_;               ///< 反馈写线程
     std::atomic<bool> feedback_recording_{false};      ///< 反馈录制标志
+    std::atomic<bool> feedback_writer_failed_{false};  ///< feedback 写线程是否异常退出
     std::atomic<uint64_t> feedback_frame_counter_{0};  ///< 反馈帧计数
     std::vector<std::string> feedback_frames_;         ///< 反馈帧 JSON 字符串缓存（stop 时合并用）
 

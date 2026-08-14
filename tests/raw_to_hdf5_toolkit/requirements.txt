@@ -1,0 +1,10 @@
+# raw_to_hdf5_toolkit 依赖
+# Jetson Orin NX 环境（已自带 GStreamer 1.0 + nvv4l2h264enc 硬件编码器）
+#
+# 安装:
+#   pip install -r requirements.txt
+
+h5py>=3.8.0
+Pillow>=10.0.0
+tqdm>=4.65.0
+PyYAML>=6.0

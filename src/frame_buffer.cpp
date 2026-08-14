@@ -12,6 +12,10 @@ namespace dexe_recorder
 /**
  * @brief 构造函数
  * @param max_size 队列最大容量（默认 600 帧）
+ * @return 构造完成的帧缓冲
+ *
+ * @throws 不抛出异常
+
  */
 FrameBuffer::FrameBuffer(size_t max_size) : max_size_(max_size) {}
 
@@ -22,6 +26,8 @@ FrameBuffer::FrameBuffer(size_t max_size) : max_size_(max_size) {}
  * 推入后通知一个等待的消费者。
  *
  * @param frame 要推入的帧（移动语义）
+ * @return 无
+ * @throws std::bad_alloc 队列扩容失败
  */
 void FrameBuffer::Push(Frame&& frame)
 {
@@ -47,6 +53,7 @@ void FrameBuffer::Push(Frame&& frame)
  *
  * @param out 输出帧
  * @return true 取到帧；false 队列已停止且为空
+ * @throws 不抛出异常
  */
 bool FrameBuffer::Pop(Frame* out)
 {
@@ -66,6 +73,9 @@ bool FrameBuffer::Pop(Frame* out)
  *
  * 设置停止标志后通知所有在 Pop 中等待的线程，
  * 使它们立即返回 false（队列已停止且为空）。
+ * @return 无
+ *
+ * @throws 不抛出异常
  */
 void FrameBuffer::Stop()
 {
@@ -77,8 +87,19 @@ void FrameBuffer::Stop()
 }
 
 /**
+ * @brief 获取累计丢弃帧数
+ * @return 被丢弃的帧总数
+ * @throws 不抛出异常
+ */
+size_t FrameBuffer::dropped_count() const
+{
+    return dropped_.load();
+}
+
+/**
  * @brief 获取当前队列长度
  * @return 队列中帧的数量
+ * @throws 不抛出异常
  */
 size_t FrameBuffer::size() const
 {

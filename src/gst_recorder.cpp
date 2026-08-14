@@ -15,8 +15,10 @@
  */
 #include "dexe_recorder/gst_recorder.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <vector>
 
 namespace dexe_recorder
 {
@@ -26,6 +28,8 @@ namespace dexe_recorder
  *
  * 不在构造函数里调用 gst_init，因为 ROS2/rclcpp 可能已初始化 GStreamer，
  * 重复初始化会导致警告。gst_init 在 Start() 中延迟调用。
+ * @return 构造完成的录制器
+ * @throws 不抛出异常
  */
 GstRecorder::GstRecorder()
 {
@@ -36,6 +40,8 @@ GstRecorder::GstRecorder()
  * @brief 析构函数
  *
  * 自动销毁所有 pipeline，释放 GStreamer 资源。
+ * @return 无
+ * @throws 不抛出异常
  */
 GstRecorder::~GstRecorder()
 {
@@ -45,17 +51,22 @@ GstRecorder::~GstRecorder()
 /**
  * @brief 初始化录制 pipeline
  *
- * 延迟初始化 GStreamer（首次调用时 gst_init），创建 3 条 pipeline：
- * - Head pipeline（头部相机 JPEG 拆分）
- * - Hand left pipeline（手部左相机）
- * - Hand right pipeline（手部右相机）
+ * 延迟初始化 GStreamer（首次调用时 gst_init）并保存 session 上下文。
+ * 各相机 pipeline 只在该相机首帧到达时创建。
  *
  * @param session_dir 录制目录（如 data/20260707_120000）
  * @param format VIDEO（H.264 MP4）或 JPEG（逐帧）
- * @return true 成功；false pipeline 创建失败
+ * @return true 初始化成功；false 当前已启动
+ * @throws std::bad_alloc 内部字符串状态分配失败
  */
 bool GstRecorder::Start(const std::string& session_dir, Format format)
 {
+    if (started_)
+    {
+        g_printerr("[RECORDER_ALREADY_STARTED] session=%s\n", session_dir_.c_str());
+        return false;
+    }
+
     static bool gst_inited = false;
     if (!gst_inited)
     {
@@ -63,21 +74,17 @@ bool GstRecorder::Start(const std::string& session_dir, Format format)
         gst_inited = true;
     }
 
+    session_dir_ = session_dir;
     format_ = format;
-
-    if (!CreateHeadPipeline(session_dir, format))
-    {
-        return false;
-    }
-    if (!CreateHandPipeline(session_dir, "hand_left", format))
-    {
-        return false;
-    }
-    if (!CreateHandPipeline(session_dir, "hand_right", format))
-    {
-        return false;
-    }
-
+    head_timing_ = StreamTiming{};
+    hand_left_timing_ = StreamTiming{};
+    hand_right_timing_ = StreamTiming{};
+    hand_left_width_ = 0;
+    hand_left_height_ = 0;
+    hand_left_encoding_.clear();
+    hand_right_width_ = 0;
+    hand_right_height_ = 0;
+    hand_right_encoding_.clear();
     started_ = true;
     return true;
 }
@@ -94,6 +101,8 @@ bool GstRecorder::Start(const std::string& session_dir, Format format)
  * @param session_dir 录制目录
  * @param format 录制格式（VIDEO 或 JPEG）
  * @return true 创建成功；false 创建失败
+ * @throws std::bad_alloc pipeline 字符串分配失败
+ * @throws std::filesystem::filesystem_error 创建相机输出目录失败
  */
 bool GstRecorder::CreateHeadPipeline(const std::string& session_dir, Format format)
 {
@@ -150,8 +159,8 @@ bool GstRecorder::CreateHeadPipeline(const std::string& session_dir, Format form
 
     // 参考遥操：nvjpegdec 输出 NVMM，需 nvvidconv 转系统内存再做软件裁切
     std::string pipe_str =
-        "appsrc name=head_src format=time do-timestamp=true is-live=true "
-        "caps=\"image/jpeg\" "
+        "appsrc name=head_src format=time do-timestamp=false is-live=true block=true max-bytes=8388608 "
+        "caps=\"image/jpeg,width=3840,height=1080,framerate=30/1\" "
         "! jpegparse "
         "! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 "
         "! nvjpegdec "
@@ -222,6 +231,9 @@ bool GstRecorder::CreateHeadPipeline(const std::string& session_dir, Format form
         }
         if (msg) gst_message_unref(msg);
         gst_object_unref(bus);
+        gst_object_unref(head_appsrc_);
+        head_appsrc_ = nullptr;
+        gst_element_set_state(head_pipeline_, GST_STATE_NULL);
         gst_object_unref(head_pipeline_);
         head_pipeline_ = nullptr;
         return false;
@@ -239,9 +251,19 @@ bool GstRecorder::CreateHeadPipeline(const std::string& session_dir, Format form
  * @param session_dir 录制目录
  * @param camera_name 相机名（"hand_left" 或 "hand_right"）
  * @param format 录制格式（VIDEO 或 JPEG）
+ * @param width 图像宽度
+ * @param height 图像高度
+ * @param encoding ROS 图像编码（"rgb8" 或 "bgr8"）
  * @return true 创建成功；false 创建失败
+ * @throws std::bad_alloc pipeline 字符串分配失败
+ * @throws std::filesystem::filesystem_error 创建相机输出目录失败
  */
-bool GstRecorder::CreateHandPipeline(const std::string& session_dir, const std::string& camera_name, Format format)
+bool GstRecorder::CreateHandPipeline(const std::string& session_dir,
+                                     const std::string& camera_name,
+                                     Format format,
+                                     int width,
+                                     int height,
+                                     const std::string& encoding)
 {
     std::string path;
     std::string appsrc_name;
@@ -264,7 +286,6 @@ bool GstRecorder::CreateHandPipeline(const std::string& session_dir, const std::
     if (format == Format::VIDEO)
     {
         // 视频文件放在 hand/left/ 和 hand/right/ 目录下（与遥操目录结构一致）
-        std::string dir = camera_name;  // hand_left 或 hand_right
         std::string sub = (camera_name == "hand_left") ? "hand/left" : "hand/right";
         std::filesystem::create_directories(session_dir + "/" + sub);
         path = session_dir + "/" + sub + "/video.mp4";
@@ -292,14 +313,18 @@ bool GstRecorder::CreateHandPipeline(const std::string& session_dir, const std::
         sink = "! multifilesink location=\"" + path + "\"";
     }
 
+    const std::string gst_format = (encoding == "rgb8") ? "RGB" : "BGR";
+
     // 手部相机是 raw Image，用 appsrc 推 raw video
     // video 模式需 nvvidconv 转 NVMM 给 nvv4l2h264enc
     std::string pipe_str;
     if (format == Format::VIDEO)
     {
         pipe_str = "appsrc name=" + appsrc_name +
-                   " format=time do-timestamp=true is-live=true "
-                   "caps=\"video/x-raw,format=BGR\" "
+                   " format=time do-timestamp=false is-live=true block=true max-bytes=8388608 "
+                   "caps=\"video/x-raw,format=" +
+                   gst_format + ",width=" + std::to_string(width) + ",height=" + std::to_string(height) +
+                   ",framerate=30/1\" "
                    "! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 "
                    "! nvvidconv compute-hw=1 "
                    "! video/x-raw(memory:NVMM),format=I420 "
@@ -309,8 +334,10 @@ bool GstRecorder::CreateHandPipeline(const std::string& session_dir, const std::
     else
     {
         pipe_str = "appsrc name=" + appsrc_name +
-                   " format=time do-timestamp=true is-live=true "
-                   "caps=\"video/x-raw,format=BGR\" "
+                   " format=time do-timestamp=false is-live=true block=true max-bytes=8388608 "
+                   "caps=\"video/x-raw,format=" +
+                   gst_format + ",width=" + std::to_string(width) + ",height=" + std::to_string(height) +
+                   ",framerate=30/1\" "
                    "! queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 "
                    "! videoconvert " +
                    encode_branch + sink;
@@ -340,7 +367,17 @@ bool GstRecorder::CreateHandPipeline(const std::string& session_dir, const std::
     }
     gst_app_src_set_stream_type(*appsrc_ptr, GST_APP_STREAM_TYPE_STREAM);
 
-    gst_element_set_state(*pipeline_ptr, GST_STATE_PLAYING);
+    GstStateChangeReturn ret = gst_element_set_state(*pipeline_ptr, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE || !CheckBus(*pipeline_ptr, camera_name))
+    {
+        g_printerr("[RECORDER_PIPELINE_START_FAILED] stream=%s\n", camera_name.c_str());
+        gst_object_unref(*appsrc_ptr);
+        *appsrc_ptr = nullptr;
+        gst_element_set_state(*pipeline_ptr, GST_STATE_NULL);
+        gst_object_unref(*pipeline_ptr);
+        *pipeline_ptr = nullptr;
+        return false;
+    }
     return true;
 }
 
@@ -352,18 +389,24 @@ bool GstRecorder::CreateHandPipeline(const std::string& session_dir, const std::
  *
  * @param data JPEG 字节数据（3840x1080 左右目并排）
  * @param size 字节数
+ * @param timestamp_ns ROS 源时间戳（Unix 纳秒）
+ * @return true 帧已成功交给 pipeline；false 帧未录入
+ * @throws std::bad_alloc pipeline 字符串或内部缓冲分配失败
  */
-void GstRecorder::PushCompressedFrame(const uint8_t* data, size_t size)
+bool GstRecorder::PushCompressedFrame(const uint8_t* data, size_t size, uint64_t timestamp_ns)
 {
-    if (!head_appsrc_ || !started_) return;
-
-    GstBuffer* buf = gst_buffer_new_allocate(nullptr, size, nullptr);
-    gst_buffer_fill(buf, 0, data, size);
-    GstFlowReturn ret = gst_app_src_push_buffer(head_appsrc_, buf);
-    if (ret != GST_FLOW_OK)
+    if (!started_ || data == nullptr || size == 0)
     {
-        g_printerr("Failed to push head frame\n");
+        return false;
     }
+
+    std::lock_guard<std::mutex> lock(head_mutex_);
+    if (!head_pipeline_ && !CreateHeadPipeline(session_dir_, format_))
+    {
+        g_printerr("[RECORDER_PIPELINE_CREATE_FAILED] stream=head\n");
+        return false;
+    }
+    return PushBuffer(head_appsrc_, head_pipeline_, data, size, timestamp_ns, &head_timing_, "head");
 }
 
 /**
@@ -376,33 +419,227 @@ void GstRecorder::PushCompressedFrame(const uint8_t* data, size_t size)
  * @param size 字节数
  * @param width 图像宽度
  * @param height 图像高度
- * @param encoding 编码格式（如 "rgb8"、"bgr8"，当前未使用）
+ * @param encoding 编码格式（"rgb8" 或 "bgr8"）
+ * @param step 每行字节数，允许存在行尾 padding
+ * @param timestamp_ns ROS 源时间戳（Unix 纳秒）
+ * @return true 帧已成功交给 pipeline；false 帧未录入
+ * @throws std::bad_alloc pipeline 字符串、行去 padding 缓冲或内部状态分配失败
  */
-void GstRecorder::PushHandFrame(const std::string& camera_name,
+bool GstRecorder::PushHandFrame(const std::string& camera_name,
                                 const uint8_t* data,
                                 size_t size,
                                 int width,
                                 int height,
-                                const std::string& /*encoding*/)
+                                const std::string& encoding,
+                                size_t step,
+                                uint64_t timestamp_ns)
 {
-    GstAppSrc* src = nullptr;
+    if (!started_ || data == nullptr || width <= 0 || height <= 0)
+    {
+        return false;
+    }
+    if (camera_name != "hand_left" && camera_name != "hand_right")
+    {
+        g_printerr("[RECORDER_UNSUPPORTED_CAMERA] stream=%s\n", camera_name.c_str());
+        return false;
+    }
+    if (encoding != "rgb8" && encoding != "bgr8")
+    {
+        g_printerr("[RECORDER_UNSUPPORTED_ENCODING] stream=%s encoding=%s\n", camera_name.c_str(), encoding.c_str());
+        return false;
+    }
+
+    const size_t row_bytes = static_cast<size_t>(width) * 3U;
+    if (step < row_bytes || size < step * static_cast<size_t>(height))
+    {
+        g_printerr("[RECORDER_INVALID_IMAGE_LAYOUT] stream=%s size=%zu width=%d height=%d step=%zu\n",
+                   camera_name.c_str(),
+                   size,
+                   width,
+                   height,
+                   step);
+        return false;
+    }
+
+    std::mutex* stream_mutex = nullptr;
+    GstElement** pipeline = nullptr;
+    GstAppSrc** appsrc = nullptr;
+    StreamTiming* timing = nullptr;
+    int* configured_width = nullptr;
+    int* configured_height = nullptr;
+    std::string* configured_encoding = nullptr;
     if (camera_name == "hand_left")
     {
-        src = hand_left_appsrc_;
+        stream_mutex = &hand_left_mutex_;
+        pipeline = &hand_left_pipeline_;
+        appsrc = &hand_left_appsrc_;
+        timing = &hand_left_timing_;
+        configured_width = &hand_left_width_;
+        configured_height = &hand_left_height_;
+        configured_encoding = &hand_left_encoding_;
     }
     else
     {
-        src = hand_right_appsrc_;
+        stream_mutex = &hand_right_mutex_;
+        pipeline = &hand_right_pipeline_;
+        appsrc = &hand_right_appsrc_;
+        timing = &hand_right_timing_;
+        configured_width = &hand_right_width_;
+        configured_height = &hand_right_height_;
+        configured_encoding = &hand_right_encoding_;
     }
-    if (!src || !started_) return;
 
-    GstBuffer* buf = gst_buffer_new_allocate(nullptr, size, nullptr);
-    gst_buffer_fill(buf, 0, data, size);
-    GstFlowReturn ret = gst_app_src_push_buffer(src, buf);
+    std::lock_guard<std::mutex> lock(*stream_mutex);
+    if (!*pipeline)
+    {
+        if (!CreateHandPipeline(session_dir_, camera_name, format_, width, height, encoding))
+        {
+            g_printerr("[RECORDER_PIPELINE_CREATE_FAILED] stream=%s\n", camera_name.c_str());
+            return false;
+        }
+        *configured_width = width;
+        *configured_height = height;
+        *configured_encoding = encoding;
+    }
+    else if (*configured_width != width || *configured_height != height || *configured_encoding != encoding)
+    {
+        g_printerr("[RECORDER_IMAGE_FORMAT_CHANGED] stream=%s expected=%dx%d/%s actual=%dx%d/%s\n",
+                   camera_name.c_str(),
+                   *configured_width,
+                   *configured_height,
+                   configured_encoding->c_str(),
+                   width,
+                   height,
+                   encoding.c_str());
+        return false;
+    }
+
+    if (step == row_bytes)
+    {
+        return PushBuffer(
+            *appsrc, *pipeline, data, row_bytes * static_cast<size_t>(height), timestamp_ns, timing, camera_name);
+    }
+
+    std::vector<uint8_t> packed(row_bytes * static_cast<size_t>(height));
+    for (int row = 0; row < height; ++row)
+    {
+        std::memcpy(
+            packed.data() + static_cast<size_t>(row) * row_bytes, data + static_cast<size_t>(row) * step, row_bytes);
+    }
+    return PushBuffer(*appsrc, *pipeline, packed.data(), packed.size(), timestamp_ns, timing, camera_name);
+}
+
+/**
+ * @brief 推送带显式时间戳的 GStreamer buffer
+ * @param appsrc 目标 appsrc
+ * @param pipeline 对应 pipeline
+ * @param data 紧密排列的帧数据
+ * @param size 帧字节数
+ * @param timestamp_ns ROS 源时间戳
+ * @param timing 单路时间映射状态
+ * @param stream_name 稳定日志流名称
+ * @return true 推送成功且 bus 未报告错误；false 失败
+ * @throws 不抛出异常
+ */
+bool GstRecorder::PushBuffer(GstAppSrc* appsrc,
+                             GstElement* pipeline,
+                             const uint8_t* data,
+                             size_t size,
+                             uint64_t timestamp_ns,
+                             StreamTiming* timing,
+                             const std::string& stream_name)
+{
+    if (!appsrc || !pipeline || !data || size == 0 || !timing || !CheckBus(pipeline, stream_name))
+    {
+        return false;
+    }
+
+    if (timing->first_timestamp_ns == 0)
+    {
+        timing->first_timestamp_ns = timestamp_ns;
+    }
+    GstClockTime pts = timestamp_ns >= timing->first_timestamp_ns
+                           ? static_cast<GstClockTime>(timestamp_ns - timing->first_timestamp_ns)
+                           : 0;
+    if (timing->last_pts != GST_CLOCK_TIME_NONE && pts <= timing->last_pts)
+    {
+        const GstClockTime original_pts = pts;
+        pts = timing->last_pts + 1;
+        g_printerr("[RECORDER_NON_MONOTONIC_TIMESTAMP] stream=%s source_ns=%lu original_pts=%lu adjusted_pts=%lu\n",
+                   stream_name.c_str(),
+                   timestamp_ns,
+                   original_pts,
+                   pts);
+    }
+
+    GstBuffer* buffer = gst_buffer_new_allocate(nullptr, size, nullptr);
+    if (!buffer)
+    {
+        g_printerr("[RECORDER_BUFFER_ALLOC_FAILED] stream=%s bytes=%zu\n", stream_name.c_str(), size);
+        return false;
+    }
+    gst_buffer_fill(buffer, 0, data, size);
+    GST_BUFFER_PTS(buffer) = pts;
+    GST_BUFFER_DTS(buffer) = pts;
+    GST_BUFFER_DURATION(buffer) = GST_SECOND / 30;
+
+    const GstFlowReturn ret = gst_app_src_push_buffer(appsrc, buffer);
     if (ret != GST_FLOW_OK)
     {
-        g_printerr("Failed to push %s frame\n", camera_name.c_str());
+        g_printerr("[RECORDER_PUSH_FAILED] stream=%s flow=%s(%d)\n",
+                   stream_name.c_str(),
+                   gst_flow_get_name(ret),
+                   static_cast<int>(ret));
+        CheckBus(pipeline, stream_name);
+        return false;
     }
+    timing->last_pts = pts;
+    return CheckBus(pipeline, stream_name);
+}
+
+/**
+ * @brief 非阻塞清空 pipeline bus，并报告其中的错误和警告
+ * @param pipeline 要检查的 pipeline
+ * @param stream_name 稳定日志流名称
+ * @return true 未发现错误；false 发现错误
+ * @throws 不抛出异常
+ */
+bool GstRecorder::CheckBus(GstElement* pipeline, const std::string& stream_name)
+{
+    if (!pipeline)
+    {
+        return false;
+    }
+    bool ok = true;
+    GstBus* bus = gst_element_get_bus(pipeline);
+    GstMessage* message = nullptr;
+    while ((message = gst_bus_pop(bus)) != nullptr)
+    {
+        GError* error = nullptr;
+        gchar* debug = nullptr;
+        if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
+        {
+            gst_message_parse_error(message, &error, &debug);
+            g_printerr("[RECORDER_GST_ERROR] stream=%s message=%s debug=%s\n",
+                       stream_name.c_str(),
+                       error ? error->message : "unknown",
+                       debug ? debug : "");
+            ok = false;
+        }
+        else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_WARNING)
+        {
+            gst_message_parse_warning(message, &error, &debug);
+            g_printerr("[RECORDER_GST_WARNING] stream=%s message=%s debug=%s\n",
+                       stream_name.c_str(),
+                       error ? error->message : "unknown",
+                       debug ? debug : "");
+        }
+        if (error) g_error_free(error);
+        if (debug) g_free(debug);
+        gst_message_unref(message);
+    }
+    gst_object_unref(bus);
+    return ok;
 }
 
 /**
@@ -411,72 +648,138 @@ void GstRecorder::PushHandFrame(const std::string& camera_name,
  * 向各 appsrc 发送 EOS（End Of Stream），等待 pipeline 处理完剩余帧
  * 并写出文件（qtmux 需要写 MP4 moov atom），然后销毁所有 pipeline。
  * 超时等待 10 秒。
+ * @return true 所有已录制流均完成 EOS 封装；false 至少一路失败
+ * @throws std::bad_alloc pipeline 日志字符串分配失败
  */
-void GstRecorder::Stop()
+bool GstRecorder::Stop()
 {
-    if (!started_) return;
+    if (!started_) return true;
     started_ = false;
+    bool success = true;
 
-    // 发 EOS 到各 appsrc
-    if (head_appsrc_)
     {
-        gst_app_src_end_of_stream(head_appsrc_);
+        std::lock_guard<std::mutex> lock(head_mutex_);
         if (head_pipeline_)
         {
-            GstBus* bus = gst_element_get_bus(head_pipeline_);
-            gst_bus_timed_pop_filtered(bus, 10 * GST_SECOND, GST_MESSAGE_EOS);
-            gst_object_unref(bus);
+            success = FinishPipeline(head_pipeline_, head_appsrc_, "head") && success;
         }
     }
-    if (hand_left_appsrc_)
     {
-        gst_app_src_end_of_stream(hand_left_appsrc_);
+        std::lock_guard<std::mutex> lock(hand_left_mutex_);
         if (hand_left_pipeline_)
         {
-            GstBus* bus = gst_element_get_bus(hand_left_pipeline_);
-            gst_bus_timed_pop_filtered(bus, 10 * GST_SECOND, GST_MESSAGE_EOS);
-            gst_object_unref(bus);
+            success = FinishPipeline(hand_left_pipeline_, hand_left_appsrc_, "hand_left") && success;
         }
     }
-    if (hand_right_appsrc_)
     {
-        gst_app_src_end_of_stream(hand_right_appsrc_);
+        std::lock_guard<std::mutex> lock(hand_right_mutex_);
         if (hand_right_pipeline_)
         {
-            GstBus* bus = gst_element_get_bus(hand_right_pipeline_);
-            gst_bus_timed_pop_filtered(bus, 10 * GST_SECOND, GST_MESSAGE_EOS);
-            gst_object_unref(bus);
+            success = FinishPipeline(hand_right_pipeline_, hand_right_appsrc_, "hand_right") && success;
         }
     }
 
     DestroyAll();
+    return success;
+}
+
+/**
+ * @brief 向单路 appsrc 发送 EOS 并等待完成或错误
+ * @param pipeline 目标 pipeline
+ * @param appsrc 目标 appsrc
+ * @param stream_name 稳定日志流名称
+ * @return true 收到 EOS；false pipeline 未创建、发生错误或超时
+ * @throws 不抛出异常
+ */
+bool GstRecorder::FinishPipeline(GstElement* pipeline, GstAppSrc* appsrc, const std::string& stream_name)
+{
+    if (!pipeline || !appsrc)
+    {
+        return false;
+    }
+    const GstFlowReturn eos_ret = gst_app_src_end_of_stream(appsrc);
+    if (eos_ret != GST_FLOW_OK)
+    {
+        g_printerr("[RECORDER_EOS_SEND_FAILED] stream=%s flow=%s(%d)\n",
+                   stream_name.c_str(),
+                   gst_flow_get_name(eos_ret),
+                   static_cast<int>(eos_ret));
+        CheckBus(pipeline, stream_name);
+        return false;
+    }
+
+    GstBus* bus = gst_element_get_bus(pipeline);
+    GstMessage* message = gst_bus_timed_pop_filtered(
+        bus, 10 * GST_SECOND, static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+    bool ok = false;
+    if (message && GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS)
+    {
+        ok = true;
+    }
+    else if (message && GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
+    {
+        GError* error = nullptr;
+        gchar* debug = nullptr;
+        gst_message_parse_error(message, &error, &debug);
+        g_printerr("[RECORDER_GST_ERROR] stream=%s message=%s debug=%s\n",
+                   stream_name.c_str(),
+                   error ? error->message : "unknown",
+                   debug ? debug : "");
+        if (error) g_error_free(error);
+        if (debug) g_free(debug);
+    }
+    else
+    {
+        g_printerr("[RECORDER_EOS_TIMEOUT] stream=%s timeout_sec=10\n", stream_name.c_str());
+    }
+    if (message) gst_message_unref(message);
+    gst_object_unref(bus);
+    return ok;
 }
 
 /**
  * @brief 销毁所有 pipeline
  *
  * 将每条 pipeline 置为 NULL 状态（停止），释放 GStreamer 对象引用。
- * 使用 lambda 统一处理 3 组 pipeline + appsrc。
+ * 依次释放 3 组 pipeline 和 appsrc。
+ * @return 无
+ * @throws 不抛出异常
  */
 void GstRecorder::DestroyAll()
 {
-    auto destroy = [](GstElement** pipe, GstAppSrc** src)
+    if (head_pipeline_)
     {
-        if (*pipe)
-        {
-            gst_element_set_state(*pipe, GST_STATE_NULL);
-            gst_object_unref(*pipe);
-            *pipe = nullptr;
-        }
-        if (*src)
-        {
-            gst_object_unref(*src);
-            *src = nullptr;
-        }
-    };
-    destroy(&head_pipeline_, &head_appsrc_);
-    destroy(&hand_left_pipeline_, &hand_left_appsrc_);
-    destroy(&hand_right_pipeline_, &hand_right_appsrc_);
+        gst_element_set_state(head_pipeline_, GST_STATE_NULL);
+        gst_object_unref(head_pipeline_);
+        head_pipeline_ = nullptr;
+    }
+    if (head_appsrc_)
+    {
+        gst_object_unref(head_appsrc_);
+        head_appsrc_ = nullptr;
+    }
+    if (hand_left_pipeline_)
+    {
+        gst_element_set_state(hand_left_pipeline_, GST_STATE_NULL);
+        gst_object_unref(hand_left_pipeline_);
+        hand_left_pipeline_ = nullptr;
+    }
+    if (hand_left_appsrc_)
+    {
+        gst_object_unref(hand_left_appsrc_);
+        hand_left_appsrc_ = nullptr;
+    }
+    if (hand_right_pipeline_)
+    {
+        gst_element_set_state(hand_right_pipeline_, GST_STATE_NULL);
+        gst_object_unref(hand_right_pipeline_);
+        hand_right_pipeline_ = nullptr;
+    }
+    if (hand_right_appsrc_)
+    {
+        gst_object_unref(hand_right_appsrc_);
+        hand_right_appsrc_ = nullptr;
+    }
 }
 
 }  // namespace dexe_recorder

@@ -43,7 +43,12 @@ def _make_jpeg_image(width: int = 64, height: int = 48, color=(128, 128, 128)) -
     return buf.getvalue()
 
 
-def _make_mp4_bytes(num_frames: int, width: int = 64, height: int = 48) -> bytes:
+def _make_mp4_bytes(
+    num_frames: int,
+    width: int = 64,
+    height: int = 48,
+    compliant: bool = True,
+) -> bytes:
     """生成一个小型 MP4 视频字节流（用 PyAV 编码）。"""
     import av
     from io import BytesIO
@@ -54,6 +59,8 @@ def _make_mp4_bytes(num_frames: int, width: int = 64, height: int = 48) -> bytes
     stream.width = width
     stream.height = height
     stream.pix_fmt = "yuv420p"
+    if compliant:
+        stream.options = {"profile": "baseline", "g": "30", "bf": "0"}
 
     for i in range(num_frames):
         img = Image.new("RGB", (width, height), (128 + i % 64, 128, 128))
