@@ -46,13 +46,6 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
-REQUIRED_METADATA_STRING_FIELDS = (
-    "system_version",
-    "hardware_version",
-    "ee_type",
-    "ee_name",
-)
-
 DEFAULT_MEMORY_PEAK_FACTOR = 4.0
 DEFAULT_MEMORY_RESERVE_BYTES = 512 * 1024 * 1024
 DEFAULT_WARN_VIDEO_BYTES = 512 * 1024 * 1024
@@ -104,7 +97,7 @@ def load_feedback_record(data_dir: Path) -> Optional[Dict]:
 
 
 def build_airs_root_attrs(pose_record: Dict) -> Dict:
-    """从 pose_record 构造 AIRS 根属性，缺失字段只用契约空值。"""
+    """从 pose_record 构造 auto 模式当前支持的 AIRS 根属性。"""
     metadata = pose_record.get("metadata", {})
     if not isinstance(metadata, dict):
         print("  [WARN] METADATA_INVALID_TYPE expected=dict fallback=empty")
@@ -121,19 +114,6 @@ def build_airs_root_attrs(pose_record: Dict) -> Dict:
             )
             or ""),
     }
-    for field in REQUIRED_METADATA_STRING_FIELDS:
-        value = metadata.get(field, "")
-        attrs[field] = str(value or "")
-        if not attrs[field]:
-            print(f"  [WARN] METADATA_REQUIRED_FIELD_MISSING field={field}")
-
-    ee_value_range = metadata.get("ee_value_range", [])
-    if not isinstance(ee_value_range, list):
-        print("  [WARN] METADATA_INVALID_FIELD field=ee_value_range expected=list fallback=[]")
-        ee_value_range = []
-    if not ee_value_range:
-        print("  [WARN] METADATA_REQUIRED_FIELD_MISSING field=ee_value_range")
-
     intervention_segments = metadata.get("intervention_segments", [])
     if not isinstance(intervention_segments, list):
         print(
@@ -141,7 +121,6 @@ def build_airs_root_attrs(pose_record: Dict) -> Dict:
             "field=intervention_segments expected=list fallback=[]")
         intervention_segments = []
 
-    attrs["ee_value_range"] = json.dumps(ee_value_range, ensure_ascii=False)
     attrs["intervention_segments"] = json.dumps(
         intervention_segments, ensure_ascii=False)
     return attrs
@@ -817,9 +796,6 @@ def process_session(
                 joints_group.attrs["frames"] = num_frames
                 joints_group.attrs["sample_rate"] = 30.0
                 joints_group.attrs["columns"] = json.dumps(joint_keys)
-                joints_group.attrs["end_effector_value_range"] = airs_root_attrs[
-                    "ee_value_range"]
-
                 joints_group.create_dataset(
                     "data", data=qpos_interp, compression="gzip", compression_opts=4)
                 joints_group.create_dataset(

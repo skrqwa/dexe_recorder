@@ -11,6 +11,7 @@
 #   ├── run_recorder.sh        # 启动录制
 #   ├── convert_to_hdf5.sh     # 转 HDF5
 #   ├── convert_to_hdf5.py     # 转换脚本
+#   ├── video_pipeline.py      # VIDEO 探测与对齐
 #   ├── scripts/
 #   │   └── hdf5_to_raw_toolkit/  # HDF5 反转工具
 #   │       ├── hdf5_to_raw.py
@@ -54,6 +55,7 @@ cp "$SCRIPT_DIR/run_recorder.sh" "$DEPLOY_DIR/"
 cp "$SCRIPT_DIR/recorderctl.sh" "$DEPLOY_DIR/"
 cp "$SCRIPT_DIR/convert_to_hdf5.sh" "$DEPLOY_DIR/"
 cp "$SCRIPT_DIR/convert_to_hdf5.py" "$DEPLOY_DIR/"
+cp "$SCRIPT_DIR/video_pipeline.py" "$DEPLOY_DIR/"
 cp "$SCRIPT_DIR/config/auto_recorder.yaml" "$DEPLOY_DIR/config/"
 
 # 拷贝反转工具

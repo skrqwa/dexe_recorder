@@ -160,8 +160,8 @@ class TestConvertJpegMode:
             assert np.array_equal(feedback["timestamps"][:], f["joints/timestamps"][:])
             assert feedback["data"][0, 0] == pytest.approx(10.0)
 
-    def test_pose_metadata_is_passed_through_to_airs_attrs(self, tmp_path, capsys):
-        """pose_record metadata 应按 AIRS 契约透传且保留历史末端范围属性。"""
+    def test_supported_pose_metadata_is_passed_through_to_airs_attrs(self, tmp_path):
+        """只透传 auto 模式当前支持的 pose_record metadata。"""
         session_dir = generate_jpeg_session(tmp_path, num_cam_frames=4, num_pose_frames=12)
         pose_path = next(session_dir.glob("pose_record_*.json"))
         pose_record = json.loads(pose_path.read_text(encoding="utf-8"))
@@ -186,19 +186,21 @@ class TestConvertJpegMode:
             assert f.attrs["robot_type"] == "W1_Test"
             assert f.attrs["series_number"] == "SN-REAL-001"
             assert f.attrs["language"] == "把方块放入盒中"
-            assert f.attrs["system_version"] == "v1.2.3"
-            assert f.attrs["hardware_version"] == "v0.22"
-            assert f.attrs["ee_type"] == "hand"
-            assert f.attrs["ee_name"] == "DexForce_TestHand"
-            assert json.loads(f.attrs["ee_value_range"]) == [0.0, 100.0]
             assert json.loads(f.attrs["intervention_segments"]) == [
                 [1000000.1, 1000000.2]
             ]
-            assert json.loads(f["joints"].attrs["end_effector_value_range"]) == [0.0, 100.0]
-        assert "METADATA_REQUIRED_FIELD_MISSING" not in capsys.readouterr().out
+            for field in (
+                "system_version",
+                "hardware_version",
+                "ee_type",
+                "ee_name",
+                "ee_value_range",
+            ):
+                assert field not in f.attrs
+            assert "end_effector_value_range" not in f["joints"].attrs
 
-    def test_missing_pose_metadata_is_empty_and_warned_not_fabricated(self, tmp_path, capsys):
-        """缺失的设备 metadata 应写契约空值并逐字段告警，不能猜造。"""
+    def test_unsupported_pose_metadata_is_not_written_or_warned(self, tmp_path, capsys):
+        """auto 不支持的设备 metadata 不写入 HDF5，也不产生缺失告警。"""
         session_dir = generate_jpeg_session(tmp_path, num_cam_frames=4, num_pose_frames=12)
         output_dir = tmp_path / "hdf5_output"
         output_dir.mkdir()
@@ -207,22 +209,18 @@ class TestConvertJpegMode:
 
         with h5py.File(output_dir / "test_session_jpeg.hdf5", "r") as f:
             assert f.attrs["series_number"] == ""
-            assert f.attrs["system_version"] == ""
-            assert f.attrs["hardware_version"] == ""
-            assert f.attrs["ee_type"] == ""
-            assert f.attrs["ee_name"] == ""
-            assert json.loads(f.attrs["ee_value_range"]) == []
             assert json.loads(f.attrs["intervention_segments"]) == []
-            assert json.loads(f["joints"].attrs["end_effector_value_range"]) == []
+            for field in (
+                "system_version",
+                "hardware_version",
+                "ee_type",
+                "ee_name",
+                "ee_value_range",
+            ):
+                assert field not in f.attrs
+            assert "end_effector_value_range" not in f["joints"].attrs
         warnings = capsys.readouterr().out
-        for field in (
-            "system_version",
-            "hardware_version",
-            "ee_type",
-            "ee_name",
-            "ee_value_range",
-        ):
-            assert f"METADATA_REQUIRED_FIELD_MISSING field={field}" in warnings
+        assert "METADATA_REQUIRED_FIELD_MISSING" not in warnings
 
     def test_failure_does_not_leave_final_hdf5(self, tmp_path):
         """输入媒体不完整时不得留下可被误认为成功的正式 HDF5。"""
