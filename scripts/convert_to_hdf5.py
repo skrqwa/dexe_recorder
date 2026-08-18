@@ -266,12 +266,42 @@ def build_alignment_plan(
     if source_timestamps.size == 0 or np.any(np.diff(source_timestamps) < 0):
         raise ValueError(f"ALIGNMENT_INVALID_TIMESTAMPS camera={camera}")
 
+    # 同一时间轴即使包含重复时间戳，也应保持逐帧一一对应。否则 searchsorted
+    # 会把一组相同时间戳全部映射到第一帧，误判为连续复用源帧。
+    if len(source_timestamps) == len(reference_timestamps) and np.array_equal(
+        source_timestamps, reference_timestamps
+    ):
+        source_indices = np.arange(len(source_timestamps), dtype=np.int64)
+        duplicate = np.zeros(len(source_timestamps), dtype=np.uint8)
+        return source_indices, duplicate, source_timestamps
+
     right = np.searchsorted(source_timestamps, reference_timestamps, side="left")
     right = np.clip(right, 0, len(source_timestamps) - 1)
     left = np.clip(right - 1, 0, len(source_timestamps) - 1)
     choose_left = np.abs(reference_timestamps - source_timestamps[left]) <= \
         np.abs(source_timestamps[right] - reference_timestamps)
     source_indices = np.where(choose_left, left, right).astype(np.int64)
+
+    # 最近邻无法区分同一时间戳下的多帧。源和参考都存在该重复时间戳时，
+    # 按各自出现顺序配对；源帧不足的部分才复用最后一个同时间戳源帧。
+    reference_start = 0
+    while reference_start < len(reference_timestamps):
+        reference_end = reference_start + 1
+        while (
+            reference_end < len(reference_timestamps)
+            and reference_timestamps[reference_end] == reference_timestamps[reference_start]
+        ):
+            reference_end += 1
+        if reference_end - reference_start > 1:
+            timestamp = reference_timestamps[reference_start]
+            source_start = int(np.searchsorted(source_timestamps, timestamp, side="left"))
+            source_end = int(np.searchsorted(source_timestamps, timestamp, side="right"))
+            if source_end > source_start:
+                occurrence = np.arange(reference_end - reference_start, dtype=np.int64)
+                source_indices[reference_start:reference_end] = source_start + np.minimum(
+                    occurrence, source_end - source_start - 1
+                )
+        reference_start = reference_end
     skew = np.abs(source_timestamps[source_indices] - reference_timestamps)
 
     run_length = 1

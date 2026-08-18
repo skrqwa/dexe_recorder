@@ -307,6 +307,39 @@ class TestConvertVideoMode:
             assert right.attrs["alignment_dropped_source_frames"] == 0
             assert right.attrs["alignment_max_skew_ms"] == pytest.approx(1000.0 / 30.0)
 
+    def test_video_identical_timeline_with_repeated_timestamps_keeps_all_frames(self, tmp_path):
+        """相同时间轴含重复时间戳时仍逐帧对应，不误判为连续复用。"""
+        session_dir = generate_video_session(tmp_path, num_cam_frames=6, num_pose_frames=18)
+        meta_path = session_dir / "metadata.jsonl"
+        entries = [json.loads(line) for line in meta_path.read_text().splitlines()]
+        repeated_timestamps = {}
+        for entry in entries:
+            camera = entry["camera_type"]
+            if camera == "head_right" and entry["frame_id"] == 0:
+                entry["timestamp"] += 0.001
+                entry["ros_timestamp"] += 0.001
+            if entry["frame_id"] == 2:
+                repeated_timestamps[camera] = (
+                    entry["timestamp"],
+                    entry["ros_timestamp"],
+                )
+            elif entry["frame_id"] in (3, 4):
+                entry["timestamp"], entry["ros_timestamp"] = repeated_timestamps[camera]
+        meta_path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+        output_dir = tmp_path / "hdf5_output"
+        output_dir.mkdir()
+
+        assert _run_convert(session_dir, output_dir, "video") is True
+
+        with h5py.File(output_dir / "test_session_video.hdf5", "r") as f:
+            expected_indices = np.arange(6, dtype=np.int64)
+            for camera in ("camera_head_left", "camera_head_right"):
+                assert np.array_equal(
+                    f[f"{camera}/alignment_source_indices"][:], expected_indices
+                )
+                assert int(np.count_nonzero(f[f"{camera}/alignment_duplicate"][:])) == 0
+                assert f[camera].attrs["alignment_duplicate_frames"] == 0
+
     def test_video_alignment_exceeding_skew_fails_without_final_file(self, tmp_path):
         """最近源帧偏差超过 33.3ms 时阻止正式 HDF5。"""
         session_dir = generate_video_session(tmp_path, num_cam_frames=5, num_pose_frames=15)
