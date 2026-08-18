@@ -110,6 +110,7 @@ class TeleoperationData(Enum):
     # File names and patterns
     METADATA_FILE = "metadata.jsonl"
     QPOS_PATTERN = "pose_record_*.json"
+    FEEDBACK_FILE = "feedback.json"
     IMAGE_PATH_KEY = "image_path"
     TIMESTAMP_KEY = "timestamp"
     CAMERA_TYPE_KEY = "camera_type"
@@ -363,6 +364,97 @@ def load_qpos_and_joint_keys(qpos_path: Path,) -> Tuple[np.ndarray, np.ndarray, 
     return ts, qpos, joint_keys
 
 
+def _unix_timestamp_to_seconds(timestamp: Any) -> float:
+    """将 Unix 秒、毫秒、微秒或纳秒时间戳统一转换为秒。"""
+    value = float(timestamp)
+    magnitude = abs(value)
+    if magnitude >= 1e17:
+        return value / 1e9
+    if magnitude >= 1e14:
+        return value / 1e6
+    if magnitude >= 1e11:
+        return value / 1e3
+    return value
+
+
+def _flatten_feedback_frame(frame: Dict[str, Any], frame_index: int) -> Dict[str, float]:
+    """提取一帧 robot_state 与左右 EE 的 joints，并拒绝重名字段。"""
+    data = frame.get(TeleoperationData.DATA.value, {})
+    sources = [
+        ("robot_state", data.get("robot_state", {}).get("joints", {})),
+        ("ee.left", data.get("ee", {}).get("left", {}).get("joints", {})),
+        ("ee.right", data.get("ee", {}).get("right", {}).get("joints", {})),
+    ]
+
+    flattened: Dict[str, float] = {}
+    owners: Dict[str, str] = {}
+    for source_name, joints in sources:
+        if not isinstance(joints, dict):
+            raise ValueError(
+                "FEEDBACK_JOINTS_INVALID_TYPE "
+                f"frame={frame_index} source={source_name} expected=dict")
+        for joint_name, value in joints.items():
+            if joint_name in flattened:
+                raise ValueError(
+                    "FEEDBACK_JOINT_NAME_CONFLICT "
+                    f"frame={frame_index} joint={joint_name} "
+                    f"sources={owners[joint_name]},{source_name}")
+            if not isinstance(value, (int, float)):
+                raise ValueError(
+                    "FEEDBACK_JOINT_VALUE_INVALID "
+                    f"frame={frame_index} source={source_name} joint={joint_name}")
+            flattened[joint_name] = float(value)
+            owners[joint_name] = source_name
+    return flattened
+
+
+def load_feedback_and_joint_keys(
+    feedback_path: Path,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """读取嵌套 feedback，按外层时间戳整理成与 pose 相同的二维向量。"""
+    with open(feedback_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    frames = payload.get(TeleoperationData.FRAMES.value, [])
+    if not frames:
+        return np.array([]), np.array([]), []
+
+    normalized_frames = []
+    for frame_index, frame in enumerate(frames):
+        timestamp = _unix_timestamp_to_seconds(
+            frame[TeleoperationData.TIMESTAMP_KEY.value])
+        normalized_frames.append(
+            (timestamp, frame_index, _flatten_feedback_frame(frame, frame_index)))
+    normalized_frames.sort(key=lambda item: item[0])
+
+    joint_keys = list(normalized_frames[0][2].keys())
+    expected_keys = set(joint_keys)
+    feedback_rows = []
+    timestamps = []
+    for timestamp, frame_index, values in normalized_frames:
+        actual_keys = set(values.keys())
+        if actual_keys != expected_keys:
+            missing = sorted(expected_keys - actual_keys)
+            extra = sorted(actual_keys - expected_keys)
+            raise ValueError(
+                "FEEDBACK_JOINT_SCHEMA_CHANGED "
+                f"frame={frame_index} missing={missing} extra={extra}")
+        timestamps.append(timestamp)
+        feedback_rows.append([values[key] for key in joint_keys])
+
+    return (
+        np.asarray(timestamps, dtype=np.float64),
+        np.asarray(feedback_rows, dtype=np.float32),
+        joint_keys,
+    )
+
+
+def find_feedback_file(data_dir: Path) -> Optional[Path]:
+    """查找遥操录制端生成的可选 feedback.json。"""
+    feedback_path = data_dir / TeleoperationData.FEEDBACK_FILE.value
+    return feedback_path if feedback_path.is_file() else None
+
+
 def load_language(qpos_path: Path) -> str:
     with open(qpos_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -513,6 +605,22 @@ def create_standard_hdf5(input_dir: Path, output_path: Path, config: Dict[str, A
     else:
         qpos_interp = np.zeros((len(timestamps), 0), dtype=np.float32)
 
+    # 加载可选反馈数据。上游负责关节命名，本工具只展开嵌套 joints 并对齐。
+    feedback_path = find_feedback_file(data_dir)
+    feedback_interp = None
+    feedback_keys: List[str] = []
+    if feedback_path is not None:
+        log_info(f"  Loading feedback data from: {feedback_path}")
+        ts_feedback, feedback, feedback_keys = load_feedback_and_joint_keys(feedback_path)
+        if feedback_keys:
+            log_info(
+                f"  Interpolating feedback data: {len(ts_feedback)} -> "
+                f"{len(timestamps)} frames, {len(feedback_keys)} joints")
+            feedback_interp = interp_qpos(
+                ts_feedback, feedback, np.array(timestamps, dtype=np.float64))
+        else:
+            log_warning("  Feedback file contains no joint data; skipping /feedback")
+
     # 确定每个相机的图像形状（从第一帧获取）
     camera_shapes = {}
     for camera in selected_camera_set:
@@ -613,6 +721,20 @@ def create_standard_hdf5(input_dir: Path, output_path: Path, config: Dict[str, A
             # 设置joints的timestamps
             timestamps_ns = np.array([unix_to_uint64_ns(ts) for ts in timestamps], dtype=np.uint64)
             timestamps_dataset[:] = timestamps_ns
+
+        # 创建独立 feedback 组，保持与 joints 相同的参考相机时间轴。
+        if feedback_interp is not None and feedback_keys:
+            feedback_group = h5_file.create_group("feedback")
+            feedback_group.attrs["type"] = "vector"
+            feedback_group.attrs["frames"] = len(valid_frames)
+            feedback_group.attrs["sample_rate"] = 30.0
+            feedback_group.attrs["columns"] = json.dumps(feedback_keys)
+            feedback_group.create_dataset(
+                "data", data=feedback_interp, compression="gzip", compression_opts=4)
+            timestamps_ns = np.array(
+                [unix_to_uint64_ns(ts) for ts in timestamps], dtype=np.uint64)
+            feedback_group.create_dataset(
+                "timestamps", data=timestamps_ns, compression="gzip", compression_opts=4)
 
         if fmt == "video":
             # ── 视频模式：逐帧推流 → GStreamer GPU 硬编 → MP4，不积压内存 ──
