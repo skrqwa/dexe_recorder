@@ -17,6 +17,7 @@ import bisect
 import concurrent.futures
 import json
 import multiprocessing
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import yaml
 import argparse
 import numpy as np
@@ -111,6 +112,8 @@ class TeleoperationData(Enum):
     METADATA_FILE = "metadata.jsonl"
     QPOS_PATTERN = "pose_record_*.json"
     FEEDBACK_FILE = "feedback.json"
+    TACTILE_JSONL_FILE = "tactile.jsonl"
+    TACTILE_JSON_FILE = "tactile.json"
     IMAGE_PATH_KEY = "image_path"
     TIMESTAMP_KEY = "timestamp"
     CAMERA_TYPE_KEY = "camera_type"
@@ -455,6 +458,186 @@ def find_feedback_file(data_dir: Path) -> Optional[Path]:
     return feedback_path if feedback_path.is_file() else None
 
 
+def _unix_timestamp_to_uint64_ns(timestamp: Any) -> np.uint64:
+    """按数值量级识别 Unix 时间戳单位并精确转换为整数纳秒。"""
+    try:
+        value = Decimal(str(timestamp))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"TACTILE_TIMESTAMP_INVALID value={timestamp}") from exc
+    magnitude = abs(value)
+    if magnitude >= Decimal("1e17"):
+        multiplier = Decimal("1")
+    elif magnitude >= Decimal("1e14"):
+        multiplier = Decimal("1e3")
+    elif magnitude >= Decimal("1e11"):
+        multiplier = Decimal("1e6")
+    else:
+        multiplier = Decimal("1e9")
+    nanoseconds = int((value * multiplier).to_integral_value(rounding=ROUND_HALF_UP))
+    if nanoseconds <= 0:
+        raise ValueError(f"TACTILE_TIMESTAMP_INVALID value={timestamp}")
+    return np.uint64(nanoseconds)
+
+
+def _parse_tactile_records(records: List[Tuple[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """将左右手触觉记录分别整理为保持原采样率的向量数据。"""
+    axes = ("x", "y", "z")
+    hands: Dict[str, Dict[str, Any]] = {}
+    for source, record in records:
+        hand = record.get("hand")
+        states = record.get("tactile_states", [])
+        if not isinstance(states, list):
+            raise ValueError(f"TACTILE_STATES_INVALID_TYPE source={source}")
+
+        states_with_data = [state for state in states if state.get("distributed_datas")]
+        if not states_with_data:
+            continue
+        if hand not in ("left", "right"):
+            raise ValueError(f"TACTILE_HAND_INVALID source={source} hand={hand}")
+        if len(states_with_data) != len(states):
+            raise ValueError(f"TACTILE_PARTIAL_FIELD_DATA source={source} hand={hand}")
+
+        field_names = [str(state.get("field_name", "")) for state in states]
+        if any(not name for name in field_names):
+            raise ValueError(f"TACTILE_FIELD_NAME_EMPTY source={source} hand={hand}")
+        if len(field_names) != len(set(field_names)):
+            raise ValueError(f"TACTILE_FIELD_NAME_DUPLICATE source={source} hand={hand}")
+
+        category_values = {"force": [], "torque": []}
+        category_presence = {"force": [], "torque": []}
+        for state in states:
+            distributed = state["distributed_datas"]
+            row = int(state.get("row", 0))
+            col = int(state.get("col", 0))
+            if row != 1 or col != 1 or len(distributed) != 1:
+                raise ValueError(
+                    "TACTILE_ARRAY_UNSUPPORTED "
+                    f"source={source} hand={hand} field={state.get('field_name')} "
+                    f"row={row} col={col} points={len(distributed)}")
+            point = distributed[0]
+            for category in category_values:
+                present = category in point
+                category_presence[category].append(present)
+                if present:
+                    vector = point[category]
+                    if not isinstance(vector, dict) or any(axis not in vector for axis in axes):
+                        raise ValueError(
+                            "TACTILE_VECTOR_INVALID "
+                            f"source={source} hand={hand} field={state.get('field_name')} "
+                            f"category={category}")
+                    values = [float(vector[axis]) for axis in axes]
+                    if not all(np.isfinite(value) for value in values):
+                        raise ValueError(
+                            "TACTILE_VALUE_NONFINITE "
+                            f"source={source} hand={hand} field={state.get('field_name')} "
+                            f"category={category}")
+                    category_values[category].extend(values)
+
+        categories = {}
+        for category, presence in category_presence.items():
+            if any(presence) and not all(presence):
+                raise ValueError(
+                    f"TACTILE_CATEGORY_SCHEMA_CHANGED source={source} hand={hand} "
+                    f"category={category}")
+            if all(presence):
+                categories[category] = {
+                    "columns": [f"{field}_{axis}" for field in field_names for axis in axes],
+                    "values": category_values[category],
+                }
+        if not categories:
+            continue
+
+        timestamp_ns = _unix_timestamp_to_uint64_ns(record.get("timestamp"))
+        hand_data = hands.setdefault(
+            hand,
+            {
+                "timestamps_ns": [],
+                "columns": {name: data["columns"] for name, data in categories.items()},
+                "rows": {name: [] for name in categories},
+            },
+        )
+        actual_columns = {name: data["columns"] for name, data in categories.items()}
+        if actual_columns != hand_data["columns"]:
+            raise ValueError(f"TACTILE_SCHEMA_CHANGED source={source} hand={hand}")
+        if hand_data["timestamps_ns"] and timestamp_ns < hand_data["timestamps_ns"][-1]:
+            raise ValueError(f"TACTILE_TIMESTAMP_NON_MONOTONIC source={source} hand={hand}")
+        hand_data["timestamps_ns"].append(timestamp_ns)
+        for category, data in categories.items():
+            hand_data["rows"][category].append(data["values"])
+
+    for hand_data in hands.values():
+        hand_data["timestamps_ns"] = np.asarray(hand_data["timestamps_ns"], dtype=np.uint64)
+        hand_data["data"] = {
+            category: np.asarray(rows, dtype=np.float32)
+            for category, rows in hand_data.pop("rows").items()
+        }
+    return hands
+
+
+def load_tactile_jsonl(tactile_path: Path) -> Dict[str, Dict[str, Any]]:
+    """读取旧版逐行 tactile.jsonl，空文件表示没有触觉数据。"""
+    records: List[Tuple[str, Dict[str, Any]]] = []
+    with open(tactile_path, "r", encoding="utf-8") as tactile_file:
+        for line_number, line in enumerate(tactile_file, 1):
+            if not line.strip():
+                raise ValueError(f"TACTILE_JSONL_EMPTY_LINE line={line_number}")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"TACTILE_JSONL_INVALID line={line_number}") from exc
+            record["timestamp"] = record.get("ts")
+            records.append((f"line={line_number}", record))
+    return _parse_tactile_records(records)
+
+
+def load_tactile_json(tactile_path: Path) -> Dict[str, Dict[str, Any]]:
+    """读取新版结构化 tactile.json，并使用各手侧内部的源时间戳。"""
+    with open(tactile_path, "r", encoding="utf-8") as tactile_file:
+        payload = json.load(tactile_file)
+    frames = payload.get(TeleoperationData.FRAMES.value, [])
+    if not isinstance(frames, list):
+        raise ValueError("TACTILE_FRAMES_INVALID_TYPE expected=list")
+
+    records: List[Tuple[str, Dict[str, Any]]] = []
+    for frame_index, frame in enumerate(frames):
+        frame_data = frame.get(TeleoperationData.DATA.value, {})
+        if not isinstance(frame_data, dict):
+            raise ValueError(f"TACTILE_FRAME_DATA_INVALID frame={frame_index}")
+        for hand in ("left", "right"):
+            if hand not in frame_data:
+                continue
+            side_data = frame_data[hand]
+            if not isinstance(side_data, dict):
+                raise ValueError(
+                    f"TACTILE_HAND_DATA_INVALID frame={frame_index} hand={hand}")
+            records.append(
+                (
+                    f"frame={frame_index}",
+                    {
+                        "hand": hand,
+                        "timestamp": side_data.get("timestamp"),
+                        "tactile_states": side_data.get("tactile_states", []),
+                    },
+                )
+            )
+    return _parse_tactile_records(records)
+
+
+def find_tactile_file(data_dir: Path) -> Tuple[Optional[str], Optional[Path]]:
+    """查找唯一触觉输入文件，避免新旧格式同时存在时产生歧义。"""
+    jsonl_path = data_dir / TeleoperationData.TACTILE_JSONL_FILE.value
+    json_path = data_dir / TeleoperationData.TACTILE_JSON_FILE.value
+    existing = [path for path in (jsonl_path, json_path) if path.is_file()]
+    if len(existing) > 1:
+        raise ValueError(
+            "TACTILE_MULTIPLE_INPUT_FILES files="
+            + ",".join(path.name for path in existing))
+    if not existing:
+        return None, None
+    path = existing[0]
+    return ("jsonl" if path.suffix == ".jsonl" else "json"), path
+
+
 def load_language(qpos_path: Path) -> str:
     with open(qpos_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -621,6 +804,21 @@ def create_standard_hdf5(input_dir: Path, output_path: Path, config: Dict[str, A
         else:
             log_warning("  Feedback file contains no joint data; skipping /feedback")
 
+    tactile_format, tactile_path = find_tactile_file(data_dir)
+    tactile_hands: Dict[str, Dict[str, Any]] = {}
+    if tactile_path is not None:
+        log_info(f"  Loading tactile data from: {tactile_path}")
+        tactile_hands = (
+            load_tactile_jsonl(tactile_path)
+            if tactile_format == "jsonl"
+            else load_tactile_json(tactile_path)
+        )
+        for hand, tactile_data in tactile_hands.items():
+            log_info(
+                f"  Found tactile data: hand={hand}, "
+                f"samples={len(tactile_data['timestamps_ns'])}, "
+                f"categories={sorted(tactile_data['data'])}")
+
     # 确定每个相机的图像形状（从第一帧获取）
     camera_shapes = {}
     for camera in selected_camera_set:
@@ -736,6 +934,40 @@ def create_standard_hdf5(input_dir: Path, output_path: Path, config: Dict[str, A
             feedback_group.create_dataset(
                 "timestamps", data=timestamps_ns, compression="gzip", compression_opts=4)
 
+        # 触觉保持设备原始采样，不插值到相机时间轴。
+        if tactile_hands:
+            tactile_group = h5_file.create_group("tactile")
+            tactile_group.attrs["type"] = "vector"
+            tactile_group.attrs["hands"] = json.dumps(sorted(tactile_hands))
+            for hand in sorted(tactile_hands):
+                tactile_data = tactile_hands[hand]
+                tactile_timestamps = tactile_data["timestamps_ns"]
+                hand_group = tactile_group.create_group(hand)
+                hand_group.attrs["frames"] = len(tactile_timestamps)
+                if len(tactile_timestamps) > 1 and tactile_timestamps[-1] > tactile_timestamps[0]:
+                    sample_rate = (
+                        (len(tactile_timestamps) - 1) * 1e9
+                        / float(tactile_timestamps[-1] - tactile_timestamps[0]))
+                else:
+                    sample_rate = 0.0
+                hand_group.attrs["sample_rate"] = sample_rate
+                for category in sorted(tactile_data["data"]):
+                    category_group = hand_group.create_group(category)
+                    category_group.attrs["columns"] = json.dumps(
+                        tactile_data["columns"][category])
+                    category_group.create_dataset(
+                        "data",
+                        data=tactile_data["data"][category],
+                        compression="gzip",
+                        compression_opts=4,
+                    )
+                    category_group.create_dataset(
+                        "timestamps",
+                        data=tactile_timestamps,
+                        compression="gzip",
+                        compression_opts=4,
+                    )
+
         if fmt == "video":
             # ── 视频模式：逐帧推流 → GStreamer GPU 硬编 → MP4，不积压内存 ──
             from PIL import Image
@@ -815,6 +1047,13 @@ def create_standard_hdf5(input_dir: Path, output_path: Path, config: Dict[str, A
         if _tactile_file.is_file():
             with open(_tactile_file, "rb") as tf:
                 h5_file.create_dataset("tactile_jsonl", data=np.frombuffer(tf.read(), dtype=np.uint8))
+
+        # 存储新版结构化 tactile.json，保持原始文件可逆。
+        _tactile_json_file = data_dir / "tactile.json"
+        if _tactile_json_file.is_file():
+            with open(_tactile_json_file, "rb") as tf:
+                h5_file.create_dataset(
+                    "tactile_json", data=np.frombuffer(tf.read(), dtype=np.uint8))
 
         # 存储原始目录结构（所有子目录相对路径，用于还原空目录）
         _subdirs = []
