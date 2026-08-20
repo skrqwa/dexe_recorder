@@ -482,6 +482,15 @@ def _unix_timestamp_to_uint64_ns(timestamp: Any) -> np.uint64:
 def _parse_tactile_records(records: List[Tuple[str, Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
     """将左右手触觉记录分别整理为保持原采样率的向量数据。"""
     axes = ("x", "y", "z")
+    active_hands = {
+        record.get("hand")
+        for _, record in records
+        if isinstance(record.get("tactile_states"), list)
+        and any(
+            isinstance(state, dict) and state.get("distributed_datas")
+            for state in record["tactile_states"]
+        )
+    }
     hands: Dict[str, Dict[str, Any]] = {}
     for source, record in records:
         hand = record.get("hand")
@@ -491,6 +500,9 @@ def _parse_tactile_records(records: List[Tuple[str, Dict[str, Any]]]) -> Dict[st
 
         states_with_data = [state for state in states if state.get("distributed_datas")]
         if not states_with_data:
+            if hand in active_hands:
+                raise ValueError(
+                    f"TACTILE_EMPTY_SAMPLE source={source} hand={hand}")
             continue
         if hand not in ("left", "right"):
             raise ValueError(f"TACTILE_HAND_INVALID source={source} hand={hand}")
@@ -1042,18 +1054,14 @@ def create_standard_hdf5(input_dir: Path, output_path: Path, config: Dict[str, A
             with open(_metadata_file, "rb") as mf:
                 h5_file.create_dataset("metadata_jsonl", data=np.frombuffer(mf.read(), dtype=np.uint8))
 
-        # 存储原始 tactile.jsonl（可能不存在）
-        _tactile_file = data_dir / "tactile.jsonl"
-        if _tactile_file.is_file():
-            with open(_tactile_file, "rb") as tf:
-                h5_file.create_dataset("tactile_jsonl", data=np.frombuffer(tf.read(), dtype=np.uint8))
-
-        # 存储新版结构化 tactile.json，保持原始文件可逆。
-        _tactile_json_file = data_dir / "tactile.json"
-        if _tactile_json_file.is_file():
-            with open(_tactile_json_file, "rb") as tf:
+        # 存储触觉原始文件，保持新旧格式可逆。
+        if tactile_path is not None and tactile_format is not None:
+            raw_dataset_name = f"tactile_{tactile_format}"
+            with open(tactile_path, "rb") as tactile_file:
                 h5_file.create_dataset(
-                    "tactile_json", data=np.frombuffer(tf.read(), dtype=np.uint8))
+                    raw_dataset_name,
+                    data=np.frombuffer(tactile_file.read(), dtype=np.uint8),
+                )
 
         # 存储原始目录结构（所有子目录相对路径，用于还原空目录）
         _subdirs = []

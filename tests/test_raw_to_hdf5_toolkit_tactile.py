@@ -259,3 +259,34 @@ def test_new_and_legacy_tactile_files_are_rejected_as_ambiguous(tmp_path):
     with pytest.raises(ValueError, match="TACTILE_MULTIPLE_INPUT_FILES"):
         MODULE.create_standard_hdf5(
             session_dir, tmp_path / "session.hdf5", MODULE.load_config(), fmt="jpeg")
+
+
+def test_empty_sample_on_an_active_hand_is_rejected(tmp_path):
+    """An intermittent empty payload must not silently reduce a valid hand's samples."""
+    session_dir = _create_session(tmp_path)
+    rows = [
+        {
+            "ts": 1787105702.01,
+            "hand": "right",
+            "tactile_states": [_state("PAD", (1.0, 2.0, 3.0))],
+        },
+        {
+            "ts": 1787105702.11,
+            "hand": "right",
+            "tactile_states": [],
+        },
+        {
+            "ts": 1787105702.21,
+            "hand": "right",
+            "tactile_states": [_state("PAD", (4.0, 5.0, 6.0))],
+        },
+    ]
+    (session_dir / "tactile.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match=r"TACTILE_EMPTY_SAMPLE.*line=2.*hand=right",
+    ):
+        MODULE.create_standard_hdf5(
+            session_dir, tmp_path / "session.hdf5", MODULE.load_config(), fmt="jpeg")
