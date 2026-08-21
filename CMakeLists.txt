@@ -24,6 +24,14 @@ find_package(nlohmann_json REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
 
+add_library(dexe_recorder_media_timeline
+  src/media_timeline.cpp
+)
+
+target_include_directories(dexe_recorder_media_timeline PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 # EEFeedback 消息支持（编译环境有 EEFeedback.msg 时启用，否则禁用）
 # PC1 编译默认启用，PC2 旧接口包可手动 -DUSE_EE_FEEDBACK=OFF 关闭
 option(USE_EE_FEEDBACK "Enable EEFeedback message support" ON)
@@ -58,6 +66,7 @@ ament_target_dependencies(dexe_recorder_node
 )
 
 target_link_libraries(dexe_recorder_node
+  dexe_recorder_media_timeline
   yaml-cpp
   nlohmann_json::nlohmann_json
   ${GST_LIBRARIES}
@@ -86,7 +95,15 @@ install(DIRECTORY scripts/hdf5_to_raw_toolkit
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
   ament_lint_auto_find_test_dependencies()
+
+  ament_add_gtest(test_media_timeline
+    test/test_media_timeline.cpp
+  )
+  target_link_libraries(test_media_timeline
+    dexe_recorder_media_timeline
+  )
 endif()
 
 ament_package()
