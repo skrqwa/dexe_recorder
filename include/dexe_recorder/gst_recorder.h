@@ -12,6 +12,8 @@
 #include <mutex>
 #include <string>
 
+#include "dexe_recorder/media_timeline.h"
+
 namespace dexe_recorder
 {
 
@@ -104,17 +106,6 @@ public:
 
 private:
     /**
-     * @brief 单路 appsrc 的源时间戳映射状态
-     * @return 时间映射状态类型
-     * @throws 不抛出异常
-     */
-    struct StreamTiming
-    {
-        uint64_t first_timestamp_ns = 0;              ///< 首帧 ROS 源时间戳
-        GstClockTime last_pts = GST_CLOCK_TIME_NONE;  ///< 最近成功推送帧的 PTS
-    };
-
-    /**
      * @brief 创建头部相机 pipeline（含 JPEG 解码 + 左右目拆分）
      * @param session_dir 录制目录
      * @param format 录制格式
@@ -150,7 +141,7 @@ private:
      * @param data 紧密排列的帧数据
      * @param size 帧字节数
      * @param timestamp_ns ROS 源时间戳
-     * @param timing 单路时间映射状态
+     * @param timeline 单路独立媒体时间轴
      * @param stream_name 稳定日志流名称
      * @return true 推送成功且 bus 未报告错误；false 失败
      * @throws 不抛出异常
@@ -160,7 +151,7 @@ private:
                     const uint8_t* data,
                     size_t size,
                     uint64_t timestamp_ns,
-                    StreamTiming* timing,
+                    MediaTimeline* timeline,
                     const std::string& stream_name);
 
     /**
@@ -202,9 +193,9 @@ private:
     Format format_ = Format::VIDEO;  ///< 当前录制格式
     bool started_ = false;           ///< 是否已启动
 
-    StreamTiming head_timing_;        ///< 头部左右目共享输入的时间映射
-    StreamTiming hand_left_timing_;   ///< 手部左相机时间映射
-    StreamTiming hand_right_timing_;  ///< 手部右相机时间映射
+    MediaTimeline head_timeline_;        ///< 头部左右目共享输入的媒体时间轴
+    MediaTimeline hand_left_timeline_;   ///< 手部左相机媒体时间轴
+    MediaTimeline hand_right_timeline_;  ///< 手部右相机媒体时间轴
 
     int hand_left_width_ = 0;          ///< 手部左相机首帧宽度
     int hand_left_height_ = 0;         ///< 手部左相机首帧高度

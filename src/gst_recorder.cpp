@@ -76,9 +76,9 @@ bool GstRecorder::Start(const std::string& session_dir, Format format)
 
     session_dir_ = session_dir;
     format_ = format;
-    head_timing_ = StreamTiming{};
-    hand_left_timing_ = StreamTiming{};
-    hand_right_timing_ = StreamTiming{};
+    head_timeline_ = MediaTimeline{};
+    hand_left_timeline_ = MediaTimeline{};
+    hand_right_timeline_ = MediaTimeline{};
     hand_left_width_ = 0;
     hand_left_height_ = 0;
     hand_left_encoding_.clear();
@@ -406,7 +406,7 @@ bool GstRecorder::PushCompressedFrame(const uint8_t* data, size_t size, uint64_t
         g_printerr("[RECORDER_PIPELINE_CREATE_FAILED] stream=head\n");
         return false;
     }
-    return PushBuffer(head_appsrc_, head_pipeline_, data, size, timestamp_ns, &head_timing_, "head");
+    return PushBuffer(head_appsrc_, head_pipeline_, data, size, timestamp_ns, &head_timeline_, "head");
 }
 
 /**
@@ -464,7 +464,7 @@ bool GstRecorder::PushHandFrame(const std::string& camera_name,
     std::mutex* stream_mutex = nullptr;
     GstElement** pipeline = nullptr;
     GstAppSrc** appsrc = nullptr;
-    StreamTiming* timing = nullptr;
+    MediaTimeline* timeline = nullptr;
     int* configured_width = nullptr;
     int* configured_height = nullptr;
     std::string* configured_encoding = nullptr;
@@ -473,7 +473,7 @@ bool GstRecorder::PushHandFrame(const std::string& camera_name,
         stream_mutex = &hand_left_mutex_;
         pipeline = &hand_left_pipeline_;
         appsrc = &hand_left_appsrc_;
-        timing = &hand_left_timing_;
+        timeline = &hand_left_timeline_;
         configured_width = &hand_left_width_;
         configured_height = &hand_left_height_;
         configured_encoding = &hand_left_encoding_;
@@ -483,7 +483,7 @@ bool GstRecorder::PushHandFrame(const std::string& camera_name,
         stream_mutex = &hand_right_mutex_;
         pipeline = &hand_right_pipeline_;
         appsrc = &hand_right_appsrc_;
-        timing = &hand_right_timing_;
+        timeline = &hand_right_timeline_;
         configured_width = &hand_right_width_;
         configured_height = &hand_right_height_;
         configured_encoding = &hand_right_encoding_;
@@ -517,7 +517,7 @@ bool GstRecorder::PushHandFrame(const std::string& camera_name,
     if (step == row_bytes)
     {
         return PushBuffer(
-            *appsrc, *pipeline, data, row_bytes * static_cast<size_t>(height), timestamp_ns, timing, camera_name);
+            *appsrc, *pipeline, data, row_bytes * static_cast<size_t>(height), timestamp_ns, timeline, camera_name);
     }
 
     std::vector<uint8_t> packed(row_bytes * static_cast<size_t>(height));
@@ -526,7 +526,7 @@ bool GstRecorder::PushHandFrame(const std::string& camera_name,
         std::memcpy(
             packed.data() + static_cast<size_t>(row) * row_bytes, data + static_cast<size_t>(row) * step, row_bytes);
     }
-    return PushBuffer(*appsrc, *pipeline, packed.data(), packed.size(), timestamp_ns, timing, camera_name);
+    return PushBuffer(*appsrc, *pipeline, packed.data(), packed.size(), timestamp_ns, timeline, camera_name);
 }
 
 /**
@@ -536,7 +536,7 @@ bool GstRecorder::PushHandFrame(const std::string& camera_name,
  * @param data 紧密排列的帧数据
  * @param size 帧字节数
  * @param timestamp_ns ROS 源时间戳
- * @param timing 单路时间映射状态
+ * @param timeline 单路独立媒体时间轴
  * @param stream_name 稳定日志流名称
  * @return true 推送成功且 bus 未报告错误；false 失败
  * @throws 不抛出异常
@@ -546,30 +546,12 @@ bool GstRecorder::PushBuffer(GstAppSrc* appsrc,
                              const uint8_t* data,
                              size_t size,
                              uint64_t timestamp_ns,
-                             StreamTiming* timing,
+                             MediaTimeline* timeline,
                              const std::string& stream_name)
 {
-    if (!appsrc || !pipeline || !data || size == 0 || !timing || !CheckBus(pipeline, stream_name))
+    if (!appsrc || !pipeline || !data || size == 0 || !timeline || !CheckBus(pipeline, stream_name))
     {
         return false;
-    }
-
-    if (timing->first_timestamp_ns == 0)
-    {
-        timing->first_timestamp_ns = timestamp_ns;
-    }
-    GstClockTime pts = timestamp_ns >= timing->first_timestamp_ns
-                           ? static_cast<GstClockTime>(timestamp_ns - timing->first_timestamp_ns)
-                           : 0;
-    if (timing->last_pts != GST_CLOCK_TIME_NONE && pts <= timing->last_pts)
-    {
-        const GstClockTime original_pts = pts;
-        pts = timing->last_pts + 1;
-        g_printerr("[RECORDER_NON_MONOTONIC_TIMESTAMP] stream=%s source_ns=%lu original_pts=%lu adjusted_pts=%lu\n",
-                   stream_name.c_str(),
-                   timestamp_ns,
-                   original_pts,
-                   pts);
     }
 
     GstBuffer* buffer = gst_buffer_new_allocate(nullptr, size, nullptr);
@@ -579,9 +561,26 @@ bool GstRecorder::PushBuffer(GstAppSrc* appsrc,
         return false;
     }
     gst_buffer_fill(buffer, 0, data, size);
-    GST_BUFFER_PTS(buffer) = pts;
-    GST_BUFFER_DTS(buffer) = pts;
-    GST_BUFFER_DURATION(buffer) = GST_SECOND / 30;
+    const MediaFrameTiming frame_timing = timeline->Next(timestamp_ns);
+    if (frame_timing.source_status == SourceTimestampStatus::DUPLICATE)
+    {
+        g_printerr("[RECORDER_SOURCE_TIMESTAMP_DUPLICATE] stream=%s source_ns=%lu media_pts_ns=%lu\n",
+                   stream_name.c_str(),
+                   timestamp_ns,
+                   frame_timing.pts_ns);
+    }
+    else if (frame_timing.source_status == SourceTimestampStatus::REGRESSED)
+    {
+        g_printerr(
+            "[RECORDER_SOURCE_TIMESTAMP_REGRESSED] stream=%s previous_source_ns=%lu source_ns=%lu media_pts_ns=%lu\n",
+            stream_name.c_str(),
+            frame_timing.previous_source_timestamp_ns,
+            timestamp_ns,
+            frame_timing.pts_ns);
+    }
+    GST_BUFFER_PTS(buffer) = static_cast<GstClockTime>(frame_timing.pts_ns);
+    GST_BUFFER_DTS(buffer) = static_cast<GstClockTime>(frame_timing.pts_ns);
+    GST_BUFFER_DURATION(buffer) = static_cast<GstClockTime>(frame_timing.duration_ns);
 
     const GstFlowReturn ret = gst_app_src_push_buffer(appsrc, buffer);
     if (ret != GST_FLOW_OK)
@@ -593,7 +592,6 @@ bool GstRecorder::PushBuffer(GstAppSrc* appsrc,
         CheckBus(pipeline, stream_name);
         return false;
     }
-    timing->last_pts = pts;
     return CheckBus(pipeline, stream_name);
 }
 
