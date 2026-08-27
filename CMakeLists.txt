@@ -32,6 +32,14 @@ target_include_directories(dexe_recorder_media_timeline PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+add_library(dexe_recorder_joint_schema
+  src/joint_schema.cpp
+)
+
+target_include_directories(dexe_recorder_joint_schema PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
 # EEFeedback 消息支持（编译环境有 EEFeedback.msg 时启用，否则禁用）
 # PC1 编译默认启用，PC2 旧接口包可手动 -DUSE_EE_FEEDBACK=OFF 关闭
 option(USE_EE_FEEDBACK "Enable EEFeedback message support" ON)
@@ -67,6 +75,7 @@ ament_target_dependencies(dexe_recorder_node
 
 target_link_libraries(dexe_recorder_node
   dexe_recorder_media_timeline
+  dexe_recorder_joint_schema
   yaml-cpp
   nlohmann_json::nlohmann_json
   ${GST_LIBRARIES}
@@ -103,6 +112,13 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_media_timeline
     dexe_recorder_media_timeline
+  )
+
+  ament_add_gtest(test_joint_schema
+    test/test_joint_schema.cpp
+  )
+  target_link_libraries(test_joint_schema
+    dexe_recorder_joint_schema
   )
 endif()
 

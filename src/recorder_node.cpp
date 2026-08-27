@@ -12,11 +12,13 @@
  * feedback_record.json（反馈）。相机数据经 GStreamer 硬件编码落盘。
  */
 #include "dexe_recorder/recorder_node.h"
+#include "dexe_recorder/joint_schema.h"
 
 #include <sys/stat.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <array>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <cstdio>
 #include <cstdlib>
@@ -1000,21 +1002,80 @@ bool RecorderNode::ParseStateJson(const std::string& json_str, Frame* frame)
             frame->joint_names = j["joint_name"].get<std::vector<std::string>>();
         }
         // 关节反馈
-        if (j.contains("joint_position")) frame->joint_position = j["joint_position"].get<std::vector<double>>();
-        if (j.contains("joint_velocity")) frame->joint_velocity = j["joint_velocity"].get<std::vector<double>>();
-        if (j.contains("joint_torque")) frame->joint_torque = j["joint_torque"].get<std::vector<double>>();
+        if (j.contains("joint_position"))
+            frame->joint_position = j["joint_position"].get<std::vector<double>>();
+        if (j.contains("joint_velocity"))
+            frame->joint_velocity = j["joint_velocity"].get<std::vector<double>>();
+        if (j.contains("joint_torque"))
+            frame->joint_torque = j["joint_torque"].get<std::vector<double>>();
         // 关节指令
         if (j.contains("joint_position_cmd"))
             frame->joint_position_cmd = j["joint_position_cmd"].get<std::vector<double>>();
         if (j.contains("joint_velocity_cmd"))
             frame->joint_velocity_cmd = j["joint_velocity_cmd"].get<std::vector<double>>();
-        if (j.contains("joint_torque_cmd")) frame->joint_torque_cmd = j["joint_torque_cmd"].get<std::vector<double>>();
+        if (j.contains("joint_torque_cmd"))
+            frame->joint_torque_cmd = j["joint_torque_cmd"].get<std::vector<double>>();
+
+        // 所有存在的关节数值数组必须共享同一维度，才能安全地映射关节名。
+        const std::array<std::size_t, 6> joint_value_counts = {
+            frame->joint_position.size(),
+            frame->joint_velocity.size(),
+            frame->joint_torque.size(),
+            frame->joint_position_cmd.size(),
+            frame->joint_velocity_cmd.size(),
+            frame->joint_torque_cmd.size(),
+        };
+        std::size_t joint_value_count = 0;
+        for (const std::size_t count : joint_value_counts)
+        {
+            if (count == 0)
+            {
+                continue;
+            }
+            if (joint_value_count == 0)
+            {
+                joint_value_count = count;
+                continue;
+            }
+            if (count != joint_value_count)
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                     "STATE_SCHEMA_UNSUPPORTED inconsistent joint value counts");
+                return false;
+            }
+        }
+        if (joint_value_count == 0)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "STATE_SCHEMA_UNSUPPORTED no joint values");
+            return false;
+        }
+
+        bool used_legacy_fallback = false;
+        std::string schema_error;
+        auto resolved_names = ResolveStateJointNames(
+            frame->joint_names, joint_value_count, &used_legacy_fallback, &schema_error);
+        if (resolved_names.empty())
+        {
+            RCLCPP_WARN_THROTTLE(
+                this->get_logger(), *this->get_clock(), 5000,
+                "STATE_SCHEMA_UNSUPPORTED value_count=%zu reason=%s", joint_value_count,
+                schema_error.c_str());
+            return false;
+        }
+        frame->joint_names = std::move(resolved_names);
+        if (used_legacy_fallback)
+        {
+            RCLCPP_WARN_ONCE(this->get_logger(),
+                             "STATE_JOINT_NAMES_FALLBACK count=20 mapping=w1_legacy_20");
+        }
 
         return true;
     }
     catch (const std::exception& e)
     {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "JSON parse error: %s", e.what());
+        RCLCPP_WARN_THROTTLE(
+            this->get_logger(), *this->get_clock(), 5000, "JSON parse error: %s", e.what());
         return false;
     }
 }
